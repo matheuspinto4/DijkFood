@@ -30,10 +30,10 @@ def seed_relational_database(self):
                 DROP TABLE IF EXISTS restaurantes CASCADE;
                 DROP TABLE IF EXISTS usuarios CASCADE;
 
-                CREATE TABLE usuarios (id SERIAL PRIMARY KEY, nome VARCHAR(80), email VARCHAR(80), telefone VARCHAR(20), latitude DOUBLE PRECISION, longitude DOUBLE PRECISION);
-                CREATE TABLE restaurantes (id SERIAL PRIMARY KEY, nome VARCHAR(80), tipo_cozinha VARCHAR(40), latitude DOUBLE PRECISION, longitude DOUBLE PRECISION);
-                CREATE TABLE entregadores (id SERIAL PRIMARY KEY, nome VARCHAR(80), tipo_veiculo VARCHAR(30), latitude_inicial DOUBLE PRECISION, status_ocupado BOOLEAN DEFAULT FALSE);
-                CREATE TABLE pedidos (id SERIAL PRIMARY KEY, id_usuario INT REFERENCES usuarios(id), id_restaurante INT REFERENCES restaurantes(id), id_entregador INT REFERENCES entregadores(id), status_atual VARCHAR(30), data_criacao TIMESTAMP DEFAULT NOW());
+                CREATE TABLE usuarios (id_usuario SERIAL PRIMARY KEY, nome VARCHAR(80), email VARCHAR(80), telefone VARCHAR(20), latitude DOUBLE PRECISION, longitude DOUBLE PRECISION);
+                CREATE TABLE restaurantes (id_restaurante SERIAL PRIMARY KEY, nome VARCHAR(80), tipo_cozinha VARCHAR(40), latitude DOUBLE PRECISION, longitude DOUBLE PRECISION);
+                CREATE TABLE entregadores (id_entregador SERIAL PRIMARY KEY, nome VARCHAR(80), tipo_veiculo VARCHAR(30), latitude_inicial DOUBLE PRECISION, longitude_inicial DOUBLE PRECISION, status_ocupado BOOLEAN DEFAULT FALSE);
+                CREATE TABLE pedidos (id_pedido SERIAL PRIMARY KEY, id_usuario INT REFERENCES usuarios(id_usuario), id_restaurante INT REFERENCES restaurantes(id_restaurante), id_entregador INT REFERENCES entregadores(id_entregador), data_criacao TIMESTAMP DEFAULT NOW());
                 
                 CREATE INDEX idx_entregador ON entregadores(status_ocupado) WHERE status_ocupado = FALSE;
             """)
