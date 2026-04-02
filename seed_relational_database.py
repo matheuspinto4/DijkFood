@@ -44,10 +44,11 @@ def seed_relational_database(self):
             print("Inserindo 1000 Clientes, 50 Restaurantes e 3000 Entregadores...")
             # usuarios, restaurantes, entregadores = generate_data()
 
-            # psycopg2.extras.execute_values(cur, "INSERT INTO usuarios (nome, email, telefone, latitude, longitude) VALUES %s", usuarios, page_size=500)
-            # psycopg2.extras.execute_values(cur, "INSERT INTO restaurantes (nome, tipo_cozinha, latitude, longitude) VALUES %s", restaurantes, page_size=100)
-            # psycopg2.extras.execute_values(cur, "INSERT INTO entregadores (nome, tipo_veiculo, latitude_inicial, longitude, status_ocupado) VALUES %s", entregadores, page_size=2000)
-            
+            clientes, restaurantes, entregadores = gerar_dados_falsos(1000, 50, 3000)
+            psycopg2.extras.execute_values(cur, "INSERT INTO usuarios (nome, email, telefone, latitude, longitude) VALUES %s", clientes, page_size=500)
+            psycopg2.extras.execute_values(cur, "INSERT INTO restaurantes (nome, tipo_cozinha, latitude, longitude) VALUES %s", restaurantes, page_size=100)
+            psycopg2.extras.execute_values(cur, "INSERT INTO entregadores (nome, tipo_veiculo, latitude_inicial, longitude, status_ocupado) VALUES %s", entregadores, page_size=2000)
+
             conn.commit()
             cur.close()
             conn.close()
