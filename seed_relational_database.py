@@ -1,3 +1,5 @@
+from fake_data import *
+
 def seed_relational_database(self):
         print("\n--- 5. Populando o Banco de Dados ---")
         sg_rds_id = self.resource_ids['SgRds']
@@ -40,13 +42,11 @@ def seed_relational_database(self):
             def get_lat_lon(): return random.uniform(-23.7, -23.4), random.uniform(-46.8, -46.3)
             
             print("Inserindo 1000 Clientes, 50 Restaurantes e 3000 Entregadores...")
-            usuarios = [(f"Cliente {i}", f"c{i}@email.com", "11999999999", *get_lat_lon()) for i in range(1000)]
-            restaurantes = [(f"Restaurante {i}", random.choice(["Italiana", "Japonesa", "Brasileira", "Fast Food", "Vegetariana"]), *get_lat_lon()) for i in range(50)]
-            entregadores = [(f"Entregador {i}", random.choice(["Moto", "Bicicleta", "Carro"]), *get_lat_lon(), False) for i in range(3000)]
+            # usuarios, restaurantes, entregadores = generate_data()
 
-            psycopg2.extras.execute_values(cur, "INSERT INTO usuarios (nome, email, telefone, latitude, longitude) VALUES %s", usuarios, page_size=500)
-            psycopg2.extras.execute_values(cur, "INSERT INTO restaurantes (nome, tipo_cozinha, latitude, longitude) VALUES %s", restaurantes, page_size=100)
-            psycopg2.extras.execute_values(cur, "INSERT INTO entregadores (nome, tipo_veiculo, latitude_inicial, longitude, status_ocupado) VALUES %s", entregadores, page_size=2000)
+            # psycopg2.extras.execute_values(cur, "INSERT INTO usuarios (nome, email, telefone, latitude, longitude) VALUES %s", usuarios, page_size=500)
+            # psycopg2.extras.execute_values(cur, "INSERT INTO restaurantes (nome, tipo_cozinha, latitude, longitude) VALUES %s", restaurantes, page_size=100)
+            # psycopg2.extras.execute_values(cur, "INSERT INTO entregadores (nome, tipo_veiculo, latitude_inicial, longitude, status_ocupado) VALUES %s", entregadores, page_size=2000)
             
             conn.commit()
             cur.close()
@@ -65,4 +65,4 @@ def seed_relational_database(self):
                 )
             except Exception as e:
                 print(f"Aviso ao fechar porta: {e}")
-3
+    
