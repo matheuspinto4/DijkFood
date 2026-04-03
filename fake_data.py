@@ -48,9 +48,9 @@ def gerar_dados_falsos(numero_de_clientes : int, numero_de_restaurantes : int, n
     fake.add_provider(RestauranteProvider)
 
     
-    clientes = [(f"{i}", f"{fake.name()}", f"{fake.email()}", f"{fake.phone_number()}", *get_lat_lon()) for i in range(numero_de_clientes)]
-    restaurantes = [(f"{i}", f"{fake.nome_restaurante()}", f"{fake.tipo_restaurante()}", *get_lat_lon()) for i in range(numero_de_restaurantes)]
-    entregadores = [(f"{i}", f"{fake.name()}", f"{random.choice(["moto", "carro", "caminhao", "biscicleta", "pé", "cavalo", "triciclo", "chihuahua", "galinha"])}", False, *get_lat_lon()) for i in range(numero_de_entregadores)]
+    clientes = [(f"{fake.name()}", f"{fake.email()}", f"{fake.phone_number()}", *get_lat_lon()) for i in range(numero_de_clientes)]
+    restaurantes = [(f"{fake.nome_restaurante()}", f"{fake.tipo_restaurante()}", *get_lat_lon()) for i in range(numero_de_restaurantes)]
+    entregadores = [(f"{fake.name()}", f"{random.choice(["moto", "carro", "caminhao", "biscicleta", "pé", "cavalo", "triciclo", "chihuahua", "galinha"])}", *get_lat_lon(), False) for i in range(numero_de_entregadores)]
 
     return (clientes, restaurantes, entregadores)
 
