@@ -15,7 +15,7 @@ Usage:
 """
 
 import argparse
-import boto3
+import boto3 
 import psycopg2
 import psycopg2.extras
 import random
@@ -56,6 +56,210 @@ class RestauranteProvider(BaseProvider):
             estabelecimento = self.random_element(self.prefixos)
             sobrenome = self.generator.last_name()
             return f"{estabelecimento} {sobrenome}"
+        
+class Arquitetura:
+    def __init__(self):
+        self.rds, self.ec2, self.ddb, self.s3, self.ecs, self.elbv2 = self.get_clients()
+        self.sgs = {}
+        self.vpc_id = None
+        self.pg_group = None
+
+    def get_clients(self):
+        session = boto3.Session(region_name=REGION)
+        return (
+            session.client("rds"), 
+            session.client("ec2"), 
+            session.resource("dynamodb"), 
+            session.client("s3"), 
+            session.client("ecs"), 
+            session.client("elbv2")
+        )
+    
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. ALLOCATION (RDS + DDB + S3 + EC2 + ECS/ALB)
+# ─────────────────────────────────────────────────────────────────────────────
+
+    def allocate(self):
+        self.sgs, self.vpc_id = self.create_security_groups()
+        self.pg_group = self.create_parameter_group()
+        
+        self.allocate_ec2()
+        self.allocate_dynamodb()
+        self.allocate_s3()
+        self.allocate_ecs_and_alb()
+        self.allocate_rds()
+
+    def create_security_groups(self):
+        vpcs = self.ec2.describe_vpcs(Filters=[{"Name": "isDefault", "Values": ["true"]}])
+        if not vpcs["Vpcs"]: raise RuntimeError("No default VPC found.")
+        vpc_id = vpcs["Vpcs"][0]["VpcId"]
+    
+        print("[SG]  Configurando Security Groups (Camadas de Rede)...")
+        sgs = {}
+        
+        def get_or_create_sg(name, desc):
+            try:
+                sg = self.ec2.create_security_group(GroupName=name, Description=desc, VpcId=vpc_id)
+                return sg["GroupId"]
+            except ClientError as exc:
+                if exc.response["Error"]["Code"] == "InvalidGroup.Duplicate":
+                    existing = self.ec2.describe_security_groups(Filters=[{"Name": "group-name", "Values": [name]}])
+                    return existing["SecurityGroups"][0]["GroupId"]
+                raise
+            
+        sgs['alb'] = get_or_create_sg("dijkfood-alb-sg", "SG para o Load Balancer (Aberto para Web)")
+        sgs['ecs'] = get_or_create_sg("dijkfood-ecs-sg", "SG para os Containers ECS (Recebe do ALB)")
+        sgs['ec2'] = get_or_create_sg("dijkfood-worker-sg", "SG para EC2 Worker (Dijkstra)")
+        sgs['rds'] = get_or_create_sg("dijkfood-rds-sg", "SG para Banco RDS")
+    
+        # Regras do ALB
+        try:
+            self.ec2.authorize_security_group_ingress(GroupId=sgs['alb'], IpPermissions=[{"IpProtocol": "tcp", "FromPort": 80, "ToPort": 80, "IpRanges": [{"CidrIp": "0.0.0.0/0"}]}])
+        except ClientError: pass
+    
+        # Regras do ECS
+        try:
+            self.ec2.authorize_security_group_ingress(GroupId=sgs['ecs'], IpPermissions=[{"IpProtocol": "tcp", "FromPort": API_PORT, "ToPort": API_PORT, "UserIdGroupPairs": [{"GroupId": sgs['alb']}]}])
+        except ClientError: pass
+    
+        # Regras da EC2 Worker
+        try:
+            self.ec2.authorize_security_group_ingress(GroupId=sgs['ec2'], IpPermissions=[{"IpProtocol": "tcp", "FromPort": 22, "ToPort": 22, "IpRanges": [{"CidrIp": "0.0.0.0/0"}]}])
+        except ClientError: pass
+    
+        # Regras do RDS
+        try:
+            self.ec2.authorize_security_group_ingress(GroupId=sgs['rds'], IpPermissions=[
+                {"IpProtocol": "tcp", "FromPort": DB_PORT, "ToPort": DB_PORT, "UserIdGroupPairs": [{"GroupId": sgs['ecs']}]},
+                {"IpProtocol": "tcp", "FromPort": DB_PORT, "ToPort": DB_PORT, "UserIdGroupPairs": [{"GroupId": sgs['ec2']}]},
+                {"IpProtocol": "tcp", "FromPort": DB_PORT, "ToPort": DB_PORT, "IpRanges": [{"CidrIp": "0.0.0.0/0"}]}
+            ])
+        except ClientError: pass
+    
+        print(f"[SG]  Security Groups configurados na VPC {vpc_id}")
+        return sgs, vpc_id
+    
+    def create_parameter_group(self):
+        try:
+            self.rds.create_db_parameter_group(DBParameterGroupName=PG_GROUP_NAME, DBParameterGroupFamily=f"postgres{PG_VERSION}", Description="DijkFood parameter group")
+            self.rds.modify_db_parameter_group(DBParameterGroupName=PG_GROUP_NAME, Parameters=[{"ParameterName": "work_mem", "ParameterValue": "4096", "ApplyMethod": "immediate"}])
+        except ClientError: pass
+        return PG_GROUP_NAME
+    
+    def allocate_ec2(self):
+        ssm = boto3.client("ssm", region_name=REGION)
+        ami_id = ssm.get_parameter(Name="/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2")["Parameter"]["Value"]
+        print(f"[EC2] Creating Worker Node ({EC2_INSTANCE_TYPE}) ...")
+        try:
+            self.ec2.run_instances(
+                ImageId=ami_id, InstanceType=EC2_INSTANCE_TYPE, KeyName=KEY_PAIR_NAME, 
+                SecurityGroupIds=[self.sgs['ec2']], MinCount=1, MaxCount=1,
+                TagSpecifications=[{"ResourceType": "instance", "Tags": [{"Key": "Name", "Value": "DijkFood-Worker"}]}]
+            )
+        except ClientError as e: print(f"[EC2] Warning: {e}")
+
+    def allocate_dynamodb(self):
+        for tb_name, pk_name in [(DDB_TABLE_EVENTOS, "id_pedido"), (DDB_TABLE_TELEMETRIA, "id_entregador")]:
+            print(f"[DDB] Creating table '{tb_name}' ...")
+            try:
+                table = self.ddb.create_table(
+                    TableName=tb_name,
+                    KeySchema=[{"AttributeName": pk_name, "KeyType": "HASH"}, {"AttributeName": "timestamp", "KeyType": "RANGE"}],
+                    AttributeDefinitions=[{"AttributeName": pk_name, "AttributeType": "S"}, {"AttributeName": "timestamp", "AttributeType": "S"}],
+                    BillingMode="PAY_PER_REQUEST"
+                )
+                table.wait_until_exists()
+            except ClientError: pass
+
+    def allocate_s3(self):
+        print(f"[S3]  Creating bucket '{S3_BUCKET_NAME}' ...")
+        try:
+            self.s3.create_bucket(Bucket=S3_BUCKET_NAME)
+        except ClientError: pass
+
+    def allocate_ecs_and_alb(self):
+        print(f"\n--- Criando Camada de API REST (ECS + Load Balancer) ---")
+        subnets = [s['SubnetId'] for s in self.ec2.describe_subnets(Filters=[{'Name': 'vpc-id', 'Values': [self.vpc_id]}])['Subnets']]
+
+        # 1. Cluster
+        self.ecs.create_cluster(clusterName=ECS_CLUSTER_NAME)
+        print(f"[ECS] Cluster '{ECS_CLUSTER_NAME}' verificado/criado.")
+
+        # 2. Load Balancer
+        alb_arn = None
+        try:
+            alb = self.elbv2.create_load_balancer(Name=ALB_NAME, Subnets=subnets, SecurityGroups=[self.sgs['alb']], Scheme='internet-facing')
+            alb_arn = alb['LoadBalancers'][0]['LoadBalancerArn']
+            print(f"[ALB] Load Balancer '{ALB_NAME}' criado.")
+        except ClientError as e:
+            if e.response['Error']['Code'] == 'DuplicateLoadBalancerName':
+                alb_arn = self.elbv2.describe_load_balancers(Names=[ALB_NAME])['LoadBalancers'][0]['LoadBalancerArn']
+                print(f"[ALB] Load Balancer já existe.")
+            else: raise
+
+        # 3. Target Group
+        tg_arn = None
+        try:
+            tg = self.elbv2.create_target_group(Name=TG_NAME, Protocol='HTTP', Port=API_PORT, VpcId=self.vpc_id, TargetType='ip', HealthCheckPath='/')
+            tg_arn = tg['TargetGroups'][0]['TargetGroupArn']
+            print(f"[ALB] Target Group '{TG_NAME}' criado.")
+        except ClientError as e:
+            if e.response['Error']['Code'] == 'DuplicateTargetGroupName':
+                tg_arn = self.elbv2.describe_target_groups(Names=[TG_NAME])['TargetGroups'][0]['TargetGroupArn']
+            else: raise
+
+        # 4. Listener
+        listeners = self.elbv2.describe_listeners(LoadBalancerArn=alb_arn)['Listeners']
+        if not any(l['Port'] == 80 for l in listeners):
+            self.elbv2.create_listener(LoadBalancerArn=alb_arn, Protocol='HTTP', Port=80, DefaultActions=[{'Type': 'forward', 'TargetGroupArn': tg_arn}])
+            print(f"[ALB] Listener na porta 80 criado e vinculado ao Target Group.")
+
+        # 5. Task Definition
+        task_def_arn = None
+        try:
+            response = self.ecs.register_task_definition(
+                family="dijkfood-api-task",
+                networkMode="awsvpc",
+                executionRoleArn=LAB_ROLE_ARN,
+                taskRoleArn=LAB_ROLE_ARN,
+                requiresCompatibilities=["FARGATE"],
+                cpu="256", memory="512",
+                containerDefinitions=[{
+                    "name": "dijkfood-api-container",
+                    "image": "nginxdemos/hello",
+                    "portMappings": [{"containerPort": API_PORT, "hostPort": API_PORT, "protocol": "tcp"}]
+                }]
+            )
+            task_def_arn = response['taskDefinition']['taskDefinitionArn']
+            print(f"[ECS] Task Definition 'dijkfood-api-task' registrada.")
+        except ClientError as e: print(f"[ECS] Aviso Task Def: {e}")
+
+        # 6. Service
+        try:
+            self.ecs.create_service(
+                cluster=ECS_CLUSTER_NAME, serviceName="dijkfood-api-service", taskDefinition=task_def_arn,
+                desiredCount=2, launchType="FARGATE",
+                networkConfiguration={'awsvpcConfiguration': {'subnets': subnets, 'securityGroups': [self.sgs['ecs']], 'assignPublicIp': 'ENABLED'}},
+                loadBalancers=[{'targetGroupArn': tg_arn, 'containerName': 'dijkfood-api-container', 'containerPort': API_PORT}]
+            )
+            print(f"[ECS] Serviço Fargate iniciado com 2 contêineres!")
+        except ClientError as e:
+            if e.response['Error']['Code'] != 'InvalidParameterException':
+                print(f"[ECS] Aviso Service: {e}")
+
+        print(f"\n[ALB] URL da sua API: http://{self.elbv2.describe_load_balancers(Names=[ALB_NAME])['LoadBalancers'][0]['DNSName']}")
+
+    def allocate_rds(self):
+        print(f"[RDS] Creating '{DB_INSTANCE_ID}' ({INSTANCE_CLASS}) ...")
+        try:
+            self.rds.create_db_instance(
+                DBInstanceIdentifier=DB_INSTANCE_ID, DBInstanceClass=INSTANCE_CLASS, Engine="postgres",
+                EngineVersion=PG_VERSION, MasterUsername=DB_ADMIN_USER, MasterUserPassword=DB_PASSWORD,
+                DBName=DB_NAME, AllocatedStorage=20, StorageType="gp2", VpcSecurityGroupIds=[self.sgs['rds']],
+                DBParameterGroupName=self.pg_group, PubliclyAccessible=True, BackupRetentionPeriod=1, MultiAZ=False
+            )
+        except ClientError: pass
+
 
 def get_lat_lon(): 
     return random.uniform(-23.7, -23.4), random.uniform(-46.8, -46.3)
@@ -105,190 +309,6 @@ ECS_CLUSTER_NAME = "DijkFoodCluster"
 ALB_NAME         = "dijkfood-api-alb"
 TG_NAME          = "dijkfood-api-tg"
 API_PORT         = 80 # A porta que o container vai escutar (Mudar para 8000 se usar FastAPI puro)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 1. ALLOCATION (RDS + DDB + S3 + EC2 + ECS/ALB)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def get_clients():
-    session = boto3.Session(region_name=REGION)
-    return (
-        session.client("rds"), session.client("ec2"), session.resource("dynamodb"), 
-        session.client("s3"), session.client("ecs"), session.client("elbv2")
-    )
-
-def create_security_groups(ec2):
-    vpcs = ec2.describe_vpcs(Filters=[{"Name": "isDefault", "Values": ["true"]}])
-    if not vpcs["Vpcs"]: raise RuntimeError("No default VPC found.")
-    vpc_id = vpcs["Vpcs"][0]["VpcId"]
-
-    print("[SG]  Configurando Security Groups (Camadas de Rede)...")
-    sgs = {}
-    
-    # Função auxiliar para criar SG
-    def get_or_create_sg(name, desc):
-        try:
-            sg = ec2.create_security_group(GroupName=name, Description=desc, VpcId=vpc_id)
-            return sg["GroupId"]
-        except ClientError as exc:
-            if exc.response["Error"]["Code"] == "InvalidGroup.Duplicate":
-                existing = ec2.describe_security_groups(Filters=[{"Name": "group-name", "Values": [name]}])
-                return existing["SecurityGroups"][0]["GroupId"]
-            raise
-
-    sgs['alb'] = get_or_create_sg("dijkfood-alb-sg", "SG para o Load Balancer (Aberto para Web)")
-    sgs['ecs'] = get_or_create_sg("dijkfood-ecs-sg", "SG para os Containers ECS (Recebe do ALB)")
-    sgs['ec2'] = get_or_create_sg("dijkfood-worker-sg", "SG para EC2 Worker (Dijkstra)")
-    sgs['rds'] = get_or_create_sg("dijkfood-rds-sg", "SG para Banco RDS")
-
-    # Regras do ALB (Recebe tráfego da internet)
-    try:
-        ec2.authorize_security_group_ingress(GroupId=sgs['alb'], IpPermissions=[{"IpProtocol": "tcp", "FromPort": 80, "ToPort": 80, "IpRanges": [{"CidrIp": "0.0.0.0/0"}]}])
-    except ClientError: pass
-
-    # Regras do ECS (Recebe tráfego apenas do ALB)
-    try:
-        ec2.authorize_security_group_ingress(GroupId=sgs['ecs'], IpPermissions=[{"IpProtocol": "tcp", "FromPort": API_PORT, "ToPort": API_PORT, "UserIdGroupPairs": [{"GroupId": sgs['alb']}]}])
-    except ClientError: pass
-
-    # Regras da EC2 Worker (Acesso SSH para você)
-    try:
-        ec2.authorize_security_group_ingress(GroupId=sgs['ec2'], IpPermissions=[{"IpProtocol": "tcp", "FromPort": 22, "ToPort": 22, "IpRanges": [{"CidrIp": "0.0.0.0/0"}]}])
-    except ClientError: pass
-
-    # Regras do RDS (Recebe do ECS, da EC2 e do seu script local para popular)
-    try:
-        ec2.authorize_security_group_ingress(GroupId=sgs['rds'], IpPermissions=[
-            {"IpProtocol": "tcp", "FromPort": DB_PORT, "ToPort": DB_PORT, "UserIdGroupPairs": [{"GroupId": sgs['ecs']}]},
-            {"IpProtocol": "tcp", "FromPort": DB_PORT, "ToPort": DB_PORT, "UserIdGroupPairs": [{"GroupId": sgs['ec2']}]},
-            {"IpProtocol": "tcp", "FromPort": DB_PORT, "ToPort": DB_PORT, "IpRanges": [{"CidrIp": "0.0.0.0/0"}]} # Temporário para o script rodar
-        ])
-    except ClientError: pass
-
-    print(f"[SG]  Security Groups configurados na VPC {vpc_id}")
-    return sgs, vpc_id
-
-def create_parameter_group(rds):
-    try:
-        rds.create_db_parameter_group(DBParameterGroupName=PG_GROUP_NAME, DBParameterGroupFamily=f"postgres{PG_VERSION}", Description="DijkFood parameter group")
-        rds.modify_db_parameter_group(DBParameterGroupName=PG_GROUP_NAME, Parameters=[{"ParameterName": "work_mem", "ParameterValue": "4096", "ApplyMethod": "immediate"}])
-    except ClientError: pass
-    return PG_GROUP_NAME
-
-def allocate_rds(rds, sg_id, pg_group):
-    print(f"[RDS] Creating '{DB_INSTANCE_ID}' ({INSTANCE_CLASS}) ...")
-    try:
-        rds.create_db_instance(
-            DBInstanceIdentifier=DB_INSTANCE_ID, DBInstanceClass=INSTANCE_CLASS, Engine="postgres",
-            EngineVersion=PG_VERSION, MasterUsername=DB_ADMIN_USER, MasterUserPassword=DB_PASSWORD,
-            DBName=DB_NAME, AllocatedStorage=20, StorageType="gp2", VpcSecurityGroupIds=[sg_id],
-            DBParameterGroupName=pg_group, PubliclyAccessible=True, BackupRetentionPeriod=1, MultiAZ=False # Alterar para True depois para Tolerância a Falhas
-        )
-    except ClientError: pass
-
-def allocate_dynamodb(ddb):
-    for tb_name, pk_name in [(DDB_TABLE_EVENTOS, "id_pedido"), (DDB_TABLE_TELEMETRIA, "id_entregador")]:
-        print(f"[DDB] Creating table '{tb_name}' ...")
-        try:
-            table = ddb.create_table(
-                TableName=tb_name,
-                KeySchema=[{"AttributeName": pk_name, "KeyType": "HASH"}, {"AttributeName": "timestamp", "KeyType": "RANGE"}],
-                AttributeDefinitions=[{"AttributeName": pk_name, "AttributeType": "S"}, {"AttributeName": "timestamp", "AttributeType": "S"}],
-                BillingMode="PAY_PER_REQUEST"
-            )
-            table.wait_until_exists()
-        except ClientError: pass
-
-def allocate_s3(s3):
-    print(f"[S3]  Creating bucket '{S3_BUCKET_NAME}' ...")
-    try:
-        s3.create_bucket(Bucket=S3_BUCKET_NAME)
-    except ClientError: pass
-
-def allocate_ec2(ec2, sg_id):
-    ssm = boto3.client("ssm", region_name=REGION)
-    ami_id = ssm.get_parameter(Name="/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2")["Parameter"]["Value"]
-    print(f"[EC2] Creating Worker Node ({EC2_INSTANCE_TYPE}) ...")
-    try:
-        ec2.run_instances(
-            ImageId=ami_id, InstanceType=EC2_INSTANCE_TYPE, KeyName=KEY_PAIR_NAME, SecurityGroupIds=[sg_id], MinCount=1, MaxCount=1,
-            TagSpecifications=[{"ResourceType": "instance", "Tags": [{"Key": "Name", "Value": "DijkFood-Worker"}]}]
-        )
-    except ClientError as e: print(f"[EC2] Warning: {e}")
-
-def allocate_ecs_and_alb(ecs, elbv2, ec2, sgs, vpc_id):
-    print(f"\n--- Criando Camada de API REST (ECS + Load Balancer) ---")
-    
-    subnets = [s['SubnetId'] for s in ec2.describe_subnets(Filters=[{'Name': 'vpc-id', 'Values': [vpc_id]}])['Subnets']]
-    
-    # 1. Cluster
-    ecs.create_cluster(clusterName=ECS_CLUSTER_NAME)
-    print(f"[ECS] Cluster '{ECS_CLUSTER_NAME}' verificado/criado.")
-
-    # 2. Load Balancer
-    alb_arn = None
-    try:
-        alb = elbv2.create_load_balancer(Name=ALB_NAME, Subnets=subnets, SecurityGroups=[sgs['alb']], Scheme='internet-facing')
-        alb_arn = alb['LoadBalancers'][0]['LoadBalancerArn']
-        print(f"[ALB] Load Balancer '{ALB_NAME}' criado.")
-    except ClientError as e:
-        if e.response['Error']['Code'] == 'DuplicateLoadBalancerName':
-            alb_arn = elbv2.describe_load_balancers(Names=[ALB_NAME])['LoadBalancers'][0]['LoadBalancerArn']
-            print(f"[ALB] Load Balancer já existe.")
-        else: raise
-
-    # 3. Target Group
-    tg_arn = None
-    try:
-        tg = elbv2.create_target_group(Name=TG_NAME, Protocol='HTTP', Port=API_PORT, VpcId=vpc_id, TargetType='ip', HealthCheckPath='/')
-        tg_arn = tg['TargetGroups'][0]['TargetGroupArn']
-        print(f"[ALB] Target Group '{TG_NAME}' criado.")
-    except ClientError as e:
-        if e.response['Error']['Code'] == 'DuplicateTargetGroupName':
-            tg_arn = elbv2.describe_target_groups(Names=[TG_NAME])['TargetGroups'][0]['TargetGroupArn']
-        else: raise
-
-    # 4. Listener
-    listeners = elbv2.describe_listeners(LoadBalancerArn=alb_arn)['Listeners']
-    if not any(l['Port'] == 80 for l in listeners):
-        elbv2.create_listener(LoadBalancerArn=alb_arn, Protocol='HTTP', Port=80, DefaultActions=[{'Type': 'forward', 'TargetGroupArn': tg_arn}])
-        print(f"[ALB] Listener na porta 80 criado e vinculado ao Target Group.")
-
-    # 5. Task Definition (Imagem genérica provisória)
-    task_def_arn = None
-    try:
-        response = ecs.register_task_definition(
-            family="dijkfood-api-task",
-            networkMode="awsvpc",
-            executionRoleArn=LAB_ROLE_ARN,
-            taskRoleArn=LAB_ROLE_ARN,
-            requiresCompatibilities=["FARGATE"],
-            cpu="256", memory="512",
-            containerDefinitions=[{
-                "name": "dijkfood-api-container",
-                "image": "nginxdemos/hello", # <--- AQUI ENTRARÁ O LINK DA SUA IMAGEM DOCKER (FASTAPI) DEPOIS!
-                "portMappings": [{"containerPort": API_PORT, "hostPort": API_PORT, "protocol": "tcp"}]
-            }]
-        )
-        task_def_arn = response['taskDefinition']['taskDefinitionArn']
-        print(f"[ECS] Task Definition 'dijkfood-api-task' registrada.")
-    except ClientError as e: print(f"[ECS] Aviso Task Def: {e}")
-
-    # 6. Service
-    try:
-        ecs.create_service(
-            cluster=ECS_CLUSTER_NAME, serviceName="dijkfood-api-service", taskDefinition=task_def_arn,
-            desiredCount=2, launchType="FARGATE", # desiredCount=2 garante escalabilidade básica
-            networkConfiguration={'awsvpcConfiguration': {'subnets': subnets, 'securityGroups': [sgs['ecs']], 'assignPublicIp': 'ENABLED'}},
-            loadBalancers=[{'targetGroupArn': tg_arn, 'containerName': 'dijkfood-api-container', 'containerPort': API_PORT}]
-        )
-        print(f"[ECS] Serviço Fargate iniciado com 2 contêineres!")
-    except ClientError as e:
-        if e.response['Error']['Code'] != 'InvalidParameterException': # Ignora se já existir
-            print(f"[ECS] Aviso Service: {e}")
-            
-    print(f"\n[ALB] URL da sua API: http://{elbv2.describe_load_balancers(Names=[ALB_NAME])['LoadBalancers'][0]['DNSName']}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -484,26 +504,17 @@ def main():
     parser.add_argument("--step", choices=["all", "allocate", "populate", "destroy"], default="all")
     args = parser.parse_args()
 
-    rds, ec2, ddb, s3, ecs, elbv2 = get_clients()
+    arquitetura = Arquitetura()
 
     if args.step in ("all", "allocate"):
-        sgs, vpc_id = create_security_groups(ec2)
-        pg_group = create_parameter_group(rds)
-        
-        allocate_ec2(ec2, sgs['ec2'])
-        allocate_dynamodb(ddb)
-        allocate_s3(s3)
-        allocate_ecs_and_alb(ecs, elbv2, ec2, sgs, vpc_id)
-        
-        # O RDS é bloqueante, então chamamos por último
-        allocate_rds(rds, sgs['rds'], pg_group) 
+        arquitetura.allocate()
 
     if args.step in ("all", "populate"):
         try:
             print(f"\n[RDS] Aguardando o banco ficar 'Available' para recuperar o Endpoint...")
-            rds.get_waiter("db_instance_available").wait(DBInstanceIdentifier=DB_INSTANCE_ID, WaiterConfig={"Delay": 30, "MaxAttempts": 40})
+            arquitetura.rds.get_waiter("db_instance_available").wait(DBInstanceIdentifier=DB_INSTANCE_ID, WaiterConfig={"Delay": 30, "MaxAttempts": 40})
             
-            endpoint = rds.describe_db_instances(DBInstanceIdentifier=DB_INSTANCE_ID)["DBInstances"][0]["Endpoint"]["Address"]
+            endpoint = arquitetura.rds.describe_db_instances(DBInstanceIdentifier=DB_INSTANCE_ID)["DBInstances"][0]["Endpoint"]["Address"]
             conn = connect(endpoint)
             if conn:
                 populate_rds(conn)
@@ -511,11 +522,11 @@ def main():
         except Exception as e:
             print(f"Não foi possível popular RDS: {e}")
         
-        populate_dynamodb(ddb)
-        populate_graph_s3(s3)
+        populate_dynamodb(arquitetura.ddb)
+        populate_graph_s3(arquitetura.s3)
 
     if args.step in ("all", "destroy"):
-        destroy(rds, ec2, ddb, s3, ecs, elbv2)
+        destroy(arquitetura.rds, arquitetura.ec2, arquitetura.ddb, arquitetura.s3, arquitetura.ecs, arquitetura.elbv2)
 
 if __name__ == "__main__":
     main()
