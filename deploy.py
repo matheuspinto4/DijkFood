@@ -23,6 +23,7 @@ import time
 import uuid
 import csv
 import os
+import osmnx as ox
 from decimal import Decimal
 from botocore.exceptions import ClientError
 from datetime import datetime, timedelta
@@ -369,7 +370,6 @@ def populate_dynamodb(ddb):
 
 def populate_graph_s3(s3):
     print(f"\n--- Baixando Grafo OSMnx e enviando para S3 ---")
-    import osmnx as ox
     
     edges_file = "graph_edges.csv"
     nodes_file = "graph_nodes.csv"
@@ -494,8 +494,6 @@ def main():
         allocate_dynamodb(ddb)
         allocate_s3(s3)
         allocate_ecs_and_alb(ecs, elbv2, ec2, sgs, vpc_id)
-        
-        # O RDS é bloqueante, então chamamos por último
         allocate_rds(rds, sgs['rds'], pg_group) 
 
     if args.step in ("all", "populate"):
