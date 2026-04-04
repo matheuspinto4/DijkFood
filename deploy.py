@@ -1,11 +1,11 @@
 """
-deploy_dijkfood.py — Amazon RDS (PostgreSQL) Deployment & Populate
+deploy_dijkfood.py — Amazon RDS & DynamoDB Deployment & Populate
 Criado para o projeto DijkFood
 
 Lifecycle:
-  1. allocate   — Cria parameter group, security group e a instância RDS
-  2. populate   — Cria o schema e injeta os dados falsos (Faker)
-  3. destroy    — Apaga a instância RDS, o parameter group e o security group
+  1. allocate   — Cria RDS (Postgres) + Tabelas DynamoDB
+  2. populate   — Injeta dados relacionais (Faker) no RDS e logs/eventos no DynamoDB
+  3. destroy    — Apaga a instância RDS e as tabelas DynamoDB
 
 Usage:
   python deploy_dijkfood.py                           # Cria, popula e APAGA em seguida
@@ -20,13 +20,15 @@ import psycopg2
 import psycopg2.extras
 import random
 import time
+import uuid
+from decimal import Decimal
 from botocore.exceptions import ClientError
 from datetime import datetime, timedelta
 
 from faker import Faker
 from faker.providers import BaseProvider
 
-# ── Custom Faker Provider ──────────────────────────────────────────────────────
+# ── Custom Faker Provider (RDS) ────────────────────────────────────────────────
 class RestauranteProvider(BaseProvider):
     tipos_culinaria = [
         'Pizzaria', 'Churrascaria', 'Comida Japonesa', 'Comida Mineira', 
@@ -56,8 +58,11 @@ class RestauranteProvider(BaseProvider):
 def get_lat_lon(): 
     return random.uniform(-23.7, -23.4), random.uniform(-46.8, -46.3)
 
+
 # ── Configuration ──────────────────────────────────────────────────────────────
 REGION         = "us-east-1"
+
+# Configurações RDS
 DB_INSTANCE_ID = "dijkfood-primary"
 DB_NAME        = "dijkfooddb"
 DB_ADMIN_USER  = "dijk_admin"
@@ -68,19 +73,27 @@ PG_VERSION     = "16"
 SG_NAME        = "dijkfood-sg"
 PG_GROUP_NAME  = "dijkfood-pg16"   
 
+# Dados RDS
 N_CLIENTES     = 1000
 N_RESTAURANTES = 50
 N_ENTREGADORES = 3000
 N_PEDIDOS      = 50000
 
+# Configurações DynamoDB
+DDB_TABLE_EVENTOS    = "dijkfood-historico-eventos"
+DDB_TABLE_TELEMETRIA = "dijkfood-telemetria-entregadores"
+N_DDB_ITEMS          = 50_000
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# 1. ALLOCATION
+# 1. ALLOCATION (RDS + DynamoDB)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_clients():
     session = boto3.Session(region_name=REGION)
-    return session.client("rds"), session.client("ec2")
+    return session.client("rds"), session.client("ec2"), session.resource("dynamodb")
 
+# --- Funções de Alocação RDS ---
 def create_parameter_group(rds):
     print(f"[PG]  Creating parameter group '{PG_GROUP_NAME}' ...")
     try:
@@ -91,11 +104,7 @@ def create_parameter_group(rds):
         )
         rds.modify_db_parameter_group(
             DBParameterGroupName=PG_GROUP_NAME,
-            Parameters=[{
-                "ParameterName":  "work_mem",
-                "ParameterValue": "4096",      # 4 MB
-                "ApplyMethod":    "immediate",
-            }],
+            Parameters=[{"ParameterName": "work_mem", "ParameterValue": "4096", "ApplyMethod": "immediate"}],
         )
         print("[PG]  Created  (work_mem = 4 MB)")
     except ClientError as exc:
@@ -112,27 +121,16 @@ def create_security_group(ec2):
     vpc_id = vpcs["Vpcs"][0]["VpcId"]
 
     try:
-        sg    = ec2.create_security_group(
-            GroupName=SG_NAME,
-            Description="DijkFood RDS - PostgreSQL inbound",
-            VpcId=vpc_id,
-        )
+        sg = ec2.create_security_group(GroupName=SG_NAME, Description="DijkFood RDS SG", VpcId=vpc_id)
         sg_id = sg["GroupId"]
         ec2.authorize_security_group_ingress(
             GroupId=sg_id,
-            IpPermissions=[{
-                "IpProtocol": "tcp",
-                "FromPort":   DB_PORT,
-                "ToPort":     DB_PORT,
-                "IpRanges":   [{"CidrIp": "0.0.0.0/0"}],
-            }],
+            IpPermissions=[{"IpProtocol": "tcp", "FromPort": DB_PORT, "ToPort": DB_PORT, "IpRanges": [{"CidrIp": "0.0.0.0/0"}]}],
         )
         print(f"[SG]  Created {sg_id}  (VPC: {vpc_id})")
     except ClientError as exc:
         if exc.response["Error"]["Code"] == "InvalidGroup.Duplicate":
-            existing = ec2.describe_security_groups(
-                Filters=[{"Name": "group-name", "Values": [SG_NAME]}]
-            )
+            existing = ec2.describe_security_groups(Filters=[{"Name": "group-name", "Values": [SG_NAME]}])
             sg_id = existing["SecurityGroups"][0]["GroupId"]
             print(f"[SG]  Already exists: {sg_id}")
         else:
@@ -168,42 +166,65 @@ def allocate_rds(rds, sg_id, pg_group):
 
     print("[RDS] Waiting for 'available' (typically 5–8 min) ...")
     waiter = rds.get_waiter("db_instance_available")
-    waiter.wait(DBInstanceIdentifier=DB_INSTANCE_ID,
-                WaiterConfig={"Delay": 30, "MaxAttempts": 40})
+    waiter.wait(DBInstanceIdentifier=DB_INSTANCE_ID, WaiterConfig={"Delay": 30, "MaxAttempts": 40})
 
-    info     = rds.describe_db_instances(DBInstanceIdentifier=DB_INSTANCE_ID)
-    instance = info["DBInstances"][0]
-    endpoint = instance["Endpoint"]["Address"]
-    print(f"[RDS] Ready  endpoint={endpoint}  version={instance['EngineVersion']}")
+    info = rds.describe_db_instances(DBInstanceIdentifier=DB_INSTANCE_ID)
+    endpoint = info["DBInstances"][0]["Endpoint"]["Address"]
+    print(f"[RDS] Ready  endpoint={endpoint}")
     return endpoint
+
+# --- Funções de Alocação DynamoDB ---
+def create_ddb_table(ddb, table_name, pk_name):
+    print(f"[DDB] Creating table '{table_name}' ...")
+    try:
+        table = ddb.create_table(
+            TableName=table_name,
+            KeySchema=[
+                {"AttributeName": pk_name, "KeyType": "HASH"},
+                {"AttributeName": "timestamp", "KeyType": "RANGE"},
+            ],
+            AttributeDefinitions=[
+                {"AttributeName": pk_name, "AttributeType": "S"},
+                {"AttributeName": "timestamp", "AttributeType": "S"},
+            ],
+            BillingMode="PAY_PER_REQUEST",
+            Tags=[{"Key": "purpose", "Value": "dijkfood-demo"}]
+        )
+        table.wait_until_exists()
+        print(f"[DDB] Table {table_name} active.")
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] == "ResourceInUseException":
+            print(f"[DDB] Table {table_name} already exists, reusing.")
+        else:
+            raise
+
+def allocate_dynamodb(ddb):
+    create_ddb_table(ddb, DDB_TABLE_EVENTOS, "id_pedido")
+    create_ddb_table(ddb, DDB_TABLE_TELEMETRIA, "id_entregador")
+
 
 def get_primary_endpoint(rds):
     info = rds.describe_db_instances(DBInstanceIdentifier=DB_INSTANCE_ID)
     return info["DBInstances"][0]["Endpoint"]["Address"]
 
-def connect(endpoint, user=DB_ADMIN_USER, password=DB_PASSWORD, retries=6, delay=10, ssl=False):
-    kwargs = dict(
-        host=endpoint, port=DB_PORT, dbname=DB_NAME, user=user, password=password, connect_timeout=10
-    )
-    if ssl:
-        kwargs["sslmode"] = "require"
-
+def connect(endpoint, user=DB_ADMIN_USER, password=DB_PASSWORD, retries=6, delay=10):
     for attempt in range(1, retries + 1):
         try:
-            conn = psycopg2.connect(**kwargs)
+            conn = psycopg2.connect(host=endpoint, port=DB_PORT, dbname=DB_NAME, user=user, password=password, connect_timeout=10)
             print(f"[DB]  Connected  host={endpoint}  user={user}")
             return conn
         except psycopg2.OperationalError as exc:
-            if attempt == retries:
-                raise
+            if attempt == retries: raise
             print(f"[DB]  Attempt {attempt}/{retries}: {exc}. Retrying in {delay}s ...")
             time.sleep(delay)
     return None
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-# 2. POPULATE
+# 2. POPULATE (RDS + DynamoDB)
 # ─────────────────────────────────────────────────────────────────────────────
 
+# --- Populate RDS ---
 DDL = """
 CREATE TABLE IF NOT EXISTS clientes (
     id_cliente SERIAL PRIMARY KEY,
@@ -213,7 +234,6 @@ CREATE TABLE IF NOT EXISTS clientes (
     latitude DOUBLE PRECISION,
     longitude DOUBLE PRECISION
 );
-
 CREATE TABLE IF NOT EXISTS restaurantes (
     id_restaurante SERIAL PRIMARY KEY,
     nome VARCHAR(80) NOT NULL,
@@ -221,7 +241,6 @@ CREATE TABLE IF NOT EXISTS restaurantes (
     latitude DOUBLE PRECISION,
     longitude DOUBLE PRECISION
 );
-
 CREATE TABLE IF NOT EXISTS entregadores (
     id_entregador SERIAL PRIMARY KEY,
     nome VARCHAR(80) NOT NULL,
@@ -230,7 +249,6 @@ CREATE TABLE IF NOT EXISTS entregadores (
     longitude_inicial DOUBLE PRECISION,
     status_ocupado BOOLEAN DEFAULT FALSE
 );
-
 CREATE TABLE IF NOT EXISTS pedidos (
     id_pedido SERIAL PRIMARY KEY,
     id_cliente INT NOT NULL REFERENCES clientes(id_cliente),
@@ -239,14 +257,13 @@ CREATE TABLE IF NOT EXISTS pedidos (
     valor NUMERIC(8,2) NOT NULL,
     data_criacao TIMESTAMP NOT NULL
 );
-
 CREATE INDEX IF NOT EXISTS idx_entregador ON entregadores(status_ocupado) WHERE status_ocupado = FALSE;
 """
 
-def populate(conn):
+def populate_rds(conn):
+    print("\n--- Populando RDS (PostgreSQL) ---")
     with conn.cursor() as cur:
         cur.execute(DDL)
-
         fake = Faker(['pt-BR'])
         fake.add_provider(RestauranteProvider)
 
@@ -259,7 +276,6 @@ def populate(conn):
         psycopg2.extras.execute_values(cur, "INSERT INTO restaurantes (nome, tipo_cozinha, latitude, longitude) VALUES %s", restaurantes, page_size=100)
         psycopg2.extras.execute_values(cur, "INSERT INTO entregadores (nome, tipo_veiculo, latitude_inicial, longitude_inicial, status_ocupado) VALUES %s", entregadores, page_size=2000)
 
-        # Fetch IDs to create relationships
         cur.execute("SELECT id_cliente FROM clientes")
         clientes_ids = [r[0] for r in cur.fetchall()]
         cur.execute("SELECT id_restaurante FROM restaurantes")
@@ -273,11 +289,8 @@ def populate(conn):
         for i in range(N_PEDIDOS):
             data_pedido = base_date + timedelta(days=random.randint(0, 365), hours=random.randint(0,23), minutes=random.randint(0,59))
             batch.append((
-                random.choice(clientes_ids),
-                random.choice(rest_ids),
-                random.choice(ent_ids),
-                round(random.uniform(15.0, 250.0), 2),
-                data_pedido.isoformat()
+                random.choice(clientes_ids), random.choice(rest_ids), random.choice(ent_ids),
+                round(random.uniform(15.0, 250.0), 2), data_pedido.isoformat()
             ))
             if len(batch) == 5000:
                 psycopg2.extras.execute_values(cur, "INSERT INTO pedidos (id_cliente, id_restaurante, id_entregador, valor, data_criacao) VALUES %s", batch, page_size=2000)
@@ -286,23 +299,74 @@ def populate(conn):
 
         if batch:
             psycopg2.extras.execute_values(cur, "INSERT INTO pedidos (id_cliente, id_restaurante, id_entregador, valor, data_criacao) VALUES %s", batch, page_size=2000)
-
     conn.commit()
-    print(f"[DB]  Done: DijkFood populado com sucesso.")
+    print(f"[RDS] Done: DijkFood SQL populado com sucesso.")
+
+# --- Populate DynamoDB ---
+def populate_dynamodb(ddb):
+    print(f"\n--- Populando DynamoDB (NoSQL) ---")
+    tb_eventos = ddb.Table(DDB_TABLE_EVENTOS)
+    tb_telemetria = ddb.Table(DDB_TABLE_TELEMETRIA)
+    
+    base_ts = datetime.now() - timedelta(days=30)
+    status_list = ["criado", "preparando", "saiu_para_entrega", "entregue", "cancelado"]
+    
+    t0 = time.perf_counter()
+    print(f"[DDB] Injetando {N_DDB_ITEMS:,} logs de eventos de pedidos...")
+    with tb_eventos.batch_writer() as batch:
+        for i in range(N_DDB_ITEMS):
+            ts = base_ts + timedelta(minutes=i)
+            batch.put_item(Item={
+                "id_pedido": f"PEDIDO#{random.randint(1, N_PEDIDOS)}",
+                "timestamp": ts.isoformat(),
+                "status": random.choice(status_list),
+                "detalhes": "Mudança de status registrada no app",
+                "event_id": uuid.uuid4().hex[:8]
+            })
+    print(f"[DDB] Eventos injetados! ({(time.perf_counter() - t0):.1f}s)")
+
+    t0 = time.perf_counter()
+    print(f"[DDB] Injetando {N_DDB_ITEMS:,} pontos de telemetria de entregadores...")
+    with tb_telemetria.batch_writer() as batch:
+        for i in range(N_DDB_ITEMS):
+            ts = base_ts + timedelta(seconds=i*30)
+            lat, lon = get_lat_lon()
+            batch.put_item(Item={
+                "id_entregador": f"ENTREGADOR#{random.randint(1, N_ENTREGADORES)}",
+                "timestamp": ts.isoformat(),
+                "latitude": Decimal(str(round(lat, 6))),
+                "longitude": Decimal(str(round(lon, 6))),
+                "bateria": Decimal(str(random.randint(10, 100))),
+                "velocidade_kmh": Decimal(str(random.randint(0, 60)))
+            })
+    print(f"[DDB] Telemetria injetada! ({(time.perf_counter() - t0):.1f}s)")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3. TEARDOWN
+# 3. TEARDOWN (RDS + DynamoDB)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def destroy(rds, ec2):
+def destroy(rds, ec2, ddb):
     print("\n── Teardown " + "─" * 55)
     
+    # Destrói DDB
+    for tb_name in [DDB_TABLE_EVENTOS, DDB_TABLE_TELEMETRIA]:
+        print(f"[DDB] Deleting table '{tb_name}' ...")
+        try:
+            table = ddb.Table(tb_name)
+            table.delete()
+            table.wait_until_not_exists()
+            print(f"[DDB] Table {tb_name} deleted.")
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] == "ResourceNotFoundException":
+                print(f"[DDB] Table {tb_name} not found, skipping.")
+            else:
+                raise
+
+    # Destrói RDS
     print(f"[RDS] Deleting primary '{DB_INSTANCE_ID}' ...")
     try:
-        rds.delete_db_instance(
-            DBInstanceIdentifier=DB_INSTANCE_ID, SkipFinalSnapshot=True, DeleteAutomatedBackups=True,
-        )
+        rds.delete_db_instance(DBInstanceIdentifier=DB_INSTANCE_ID, SkipFinalSnapshot=True, DeleteAutomatedBackups=True)
         w = rds.get_waiter("db_instance_deleted")
         w.wait(DBInstanceIdentifier=DB_INSTANCE_ID, WaiterConfig={"Delay": 30, "MaxAttempts": 40})
         print(f"[RDS] Primary deleted.")
@@ -331,31 +395,33 @@ def destroy(rds, ec2):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="DijkFood RDS PostgreSQL Deployment")
+    parser = argparse.ArgumentParser(description="DijkFood RDS & DDB Deployment")
     parser.add_argument("--step", choices=["all", "allocate", "populate", "destroy"], default="all")
     args = parser.parse_args()
 
-    rds, ec2 = get_clients()
+    rds, ec2, ddb = get_clients()
 
     if args.step in ("all", "allocate"):
         pg_group = create_parameter_group(rds)
         sg_id    = create_security_group(ec2)
         endpoint = allocate_rds(rds, sg_id, pg_group)
+        allocate_dynamodb(ddb)
     else:
-        # Se for rodar apenas o populate ou o destroy separadamente
         try:
             endpoint = get_primary_endpoint(rds)
         except Exception:
             endpoint = None
 
-    if args.step in ("all", "populate") and endpoint:
-        conn = connect(endpoint)
-        if conn:
-            populate(conn)
-            conn.close()
+    if args.step in ("all", "populate"):
+        if endpoint:
+            conn = connect(endpoint)
+            if conn:
+                populate_rds(conn)
+                conn.close()
+        populate_dynamodb(ddb)
 
     if args.step in ("all", "destroy"):
-        destroy(rds, ec2)
+        destroy(rds, ec2, ddb)
 
 if __name__ == "__main__":
     main()
