@@ -76,9 +76,9 @@ class Arquitetura:
             session.client("elbv2")
         )
     
-# ─────────────────────────────────────────────────────────────────────────────
-# 1. ALLOCATION (RDS + DDB + S3 + EC2 + ECS/ALB)
-# ─────────────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────────
+    # ALLOCATION (RDS + DDB + S3 + EC2 + ECS/ALB)
+    # ─────────────────────────────────────────────────────────────────────────────
 
     def allocate(self):
         self.sgs, self.vpc_id = self.create_security_groups()
@@ -261,6 +261,77 @@ class Arquitetura:
             )
         except ClientError: pass
 
+    # ─────────────────────────────────────────────────────────────────────────────
+    # TEARDOWN (Limpa tudo para evitar custos)
+    # ─────────────────────────────────────────────────────────────────────────────
+
+    def destroy(self):
+        print("\n── Teardown " + "─" * 55)
+
+        # 1. Destruir ECS e ALB (A ordem importa!)
+        print(f"[ECS] Deletando ECS Service e Load Balancer...")
+        try:
+            self.ecs.update_service(cluster=ECS_CLUSTER_NAME, service="dijkfood-api-service", desiredCount=0)
+            time.sleep(10) # Espera os containers desligarem
+            self.ecs.delete_service(cluster=ECS_CLUSTER_NAME, service="dijkfood-api-service")
+        except ClientError: pass
+    
+        try:
+            tg_arn = self.elbv2.describe_target_groups(Names=[TG_NAME])['TargetGroups'][0]['TargetGroupArn']
+            alb_arn = self.elbv2.describe_load_balancers(Names=[ALB_NAME])['LoadBalancers'][0]['LoadBalancerArn']
+            self.elbv2.delete_load_balancer(LoadBalancerArn=alb_arn)
+            time.sleep(15) # Espera o ALB ser deletado para liberar o Target Group
+            self.elbv2.delete_target_group(TargetGroupArn=tg_arn)
+            print("[ALB] Load Balancer deletado.")
+        except ClientError: pass
+    
+        try: self.ecs.delete_cluster(cluster=ECS_CLUSTER_NAME)
+        except ClientError: pass
+    
+        # 2. EC2
+        print(f"[EC2] Terminating instances with name 'DijkFood-Worker' ...")
+        instances = self.ec2.describe_instances(Filters=[{"Name": "tag:Name", "Values": ["DijkFood-Worker"]}])
+        for res in instances.get("Reservations", []):
+            for inst in res.get("Instances", []):
+                if inst["State"]["Name"] != "terminated":
+                    self.ec2.terminate_instances(InstanceIds=[inst["InstanceId"]])
+    
+        # 3. S3
+        print(f"[S3]  Emptying and deleting bucket '{S3_BUCKET_NAME}' ...")
+        try:
+            response = self.s3.list_objects_v2(Bucket=S3_BUCKET_NAME)
+            if 'Contents' in response:
+                objects = [{'Key': obj['Key']} for obj in response['Contents']]
+                self.s3.delete_objects(Bucket=S3_BUCKET_NAME, Delete={'Objects': objects})
+            self.s3.delete_bucket(Bucket=S3_BUCKET_NAME)
+        except ClientError: pass
+    
+        # 4. DynamoDB 
+        for tb_name in [DDB_TABLE_EVENTOS, DDB_TABLE_TELEMETRIA]:
+            print(f"[DDB] Deleting table '{tb_name}' ...")
+            try: 
+                self.ddb.Table(tb_name).delete()
+            except ClientError: pass
+    
+        # 5. RDS & Security Groups
+        print(f"[RDS] Deleting primary '{DB_INSTANCE_ID}' ...")
+        try:
+            self.rds.delete_db_instance(DBInstanceIdentifier=DB_INSTANCE_ID, SkipFinalSnapshot=True, DeleteAutomatedBackups=True)
+            self.rds.get_waiter("db_instance_deleted").wait(DBInstanceIdentifier=DB_INSTANCE_ID, WaiterConfig={"Delay": 30, "MaxAttempts": 40})
+        except ClientError: pass
+    
+        try: 
+            self.rds.delete_db_parameter_group(DBParameterGroupName=PG_GROUP_NAME)
+        except ClientError: pass
+    
+        # Deletar SGs no final (Após RDS e EC2 estarem mortos)
+        for sg_name in ["dijkfood-ecs-sg", "dijkfood-alb-sg", "dijkfood-rds-sg", "dijkfood-worker-sg"]:
+            try:
+                sgs = self.ec2.describe_security_groups(Filters=[{"Name": "group-name", "Values": [sg_name]}])
+                if sgs["SecurityGroups"]: 
+                    self.ec2.delete_security_group(GroupId=sgs["SecurityGroups"][0]["GroupId"])
+            except ClientError: pass
+
 
 def get_lat_lon(): 
     return random.uniform(-23.7, -23.4), random.uniform(-46.8, -46.3)
@@ -427,75 +498,6 @@ def populate_graph_s3(s3):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3. TEARDOWN (Limpa tudo para evitar custos)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def destroy(rds, ec2, ddb, s3, ecs, elbv2):
-    print("\n── Teardown " + "─" * 55)
-    
-    # 1. Destruir ECS e ALB (A ordem importa!)
-    print(f"[ECS] Deletando ECS Service e Load Balancer...")
-    try:
-        ecs.update_service(cluster=ECS_CLUSTER_NAME, service="dijkfood-api-service", desiredCount=0)
-        time.sleep(10) # Espera os containers desligarem
-        ecs.delete_service(cluster=ECS_CLUSTER_NAME, service="dijkfood-api-service")
-    except ClientError: pass
-
-    try:
-        tg_arn = elbv2.describe_target_groups(Names=[TG_NAME])['TargetGroups'][0]['TargetGroupArn']
-        alb_arn = elbv2.describe_load_balancers(Names=[ALB_NAME])['LoadBalancers'][0]['LoadBalancerArn']
-        elbv2.delete_load_balancer(LoadBalancerArn=alb_arn)
-        time.sleep(15) # Espera o ALB ser deletado para liberar o Target Group
-        elbv2.delete_target_group(TargetGroupArn=tg_arn)
-        print("[ALB] Load Balancer deletado.")
-    except ClientError: pass
-
-    try: ecs.delete_cluster(cluster=ECS_CLUSTER_NAME)
-    except ClientError: pass
-
-    # 2. EC2
-    print(f"[EC2] Terminating instances with name 'DijkFood-Worker' ...")
-    instances = ec2.describe_instances(Filters=[{"Name": "tag:Name", "Values": ["DijkFood-Worker"]}])
-    for res in instances.get("Reservations", []):
-        for inst in res.get("Instances", []):
-            if inst["State"]["Name"] != "terminated":
-                ec2.terminate_instances(InstanceIds=[inst["InstanceId"]])
-
-    # 3. S3
-    print(f"[S3]  Emptying and deleting bucket '{S3_BUCKET_NAME}' ...")
-    try:
-        response = s3.list_objects_v2(Bucket=S3_BUCKET_NAME)
-        if 'Contents' in response:
-            objects = [{'Key': obj['Key']} for obj in response['Contents']]
-            s3.delete_objects(Bucket=S3_BUCKET_NAME, Delete={'Objects': objects})
-        s3.delete_bucket(Bucket=S3_BUCKET_NAME)
-    except ClientError: pass
-
-    # 4. DynamoDB
-    for tb_name in [DDB_TABLE_EVENTOS, DDB_TABLE_TELEMETRIA]:
-        print(f"[DDB] Deleting table '{tb_name}' ...")
-        try: ddb.Table(tb_name).delete()
-        except ClientError: pass
-
-    # 5. RDS & Security Groups
-    print(f"[RDS] Deleting primary '{DB_INSTANCE_ID}' ...")
-    try:
-        rds.delete_db_instance(DBInstanceIdentifier=DB_INSTANCE_ID, SkipFinalSnapshot=True, DeleteAutomatedBackups=True)
-        rds.get_waiter("db_instance_deleted").wait(DBInstanceIdentifier=DB_INSTANCE_ID, WaiterConfig={"Delay": 30, "MaxAttempts": 40})
-    except ClientError: pass
-
-    try: rds.delete_db_parameter_group(DBParameterGroupName=PG_GROUP_NAME)
-    except ClientError: pass
-
-    # Deletar SGs no final (Após RDS e EC2 estarem mortos)
-    for sg_name in ["dijkfood-ecs-sg", "dijkfood-alb-sg", "dijkfood-rds-sg", "dijkfood-worker-sg"]:
-        try:
-            sgs = ec2.describe_security_groups(Filters=[{"Name": "group-name", "Values": [sg_name]}])
-            if sgs["SecurityGroups"]: ec2.delete_security_group(GroupId=sgs["SecurityGroups"][0]["GroupId"])
-        except ClientError: pass
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # ENTRY POINT
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -526,7 +528,7 @@ def main():
         populate_graph_s3(arquitetura.s3)
 
     if args.step in ("all", "destroy"):
-        destroy(arquitetura.rds, arquitetura.ec2, arquitetura.ddb, arquitetura.s3, arquitetura.ecs, arquitetura.elbv2)
+        arquitetura.destroy()
 
 if __name__ == "__main__":
     main()
