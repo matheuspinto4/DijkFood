@@ -44,7 +44,6 @@ RITMO_EXEC = [
 ]
 
 
-# Popular o sistema com dados basicos
 async def worker(semaphore, client, url, json, results, id_register):
     async with semaphore:
         response = await client.post(
@@ -66,8 +65,7 @@ async def preload(jsons, url, id_register, ids):
         await asyncio.gather(*tasks)
     ids[id_register] = results
 
-# Cliente pode consultar o status do pedido (estado, entregador e posicao)
-# API deve responder em menos de 500ms no 95 percentil
+
 async def requester(queue, results):
     async with httpx.AsyncClient(timeout=10.0) as client:
         while True:
@@ -172,13 +170,13 @@ orders = []
 orders_lock = asyncio.Lock()
 
 async def main():
+    # Popular o sistema com dados basicos
+    ids = {}
     data = gerar_dados_falsos( # clientes, restaurantes, entregadores
         numero_de_clientes=N_CLIENTES, 
         numero_de_restaurantes=N_RESTAURANTES, 
         numero_de_entregadores=N_ENTREGADORES
     )
-
-    ids = {}
     tasks = [
         preload(jsons, URL + path, id_register, ids)
         for jsons, path, id_register in zip(
@@ -187,11 +185,13 @@ async def main():
             ["id_cliente", "id_restaurante", "id_entregador"]
         )
     ]
-
     await asyncio.gather(*tasks)
     clientes = ids["id_cliente"]
     restaurantes = ids["id_restaurante"]
     
+    
+    # Cliente pode consultar o status do pedido (estado, entregador e posicao)
+    # API deve responder em menos de 500ms no 95 percentil
     queue = asyncio.Queue()
     results = []
 
