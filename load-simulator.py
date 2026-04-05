@@ -4,6 +4,8 @@ import time
 import statistics
 import random
 
+from fake_data import gerar_dados_falsos
+
 
 # Define variaveis
 N_CLIENTES     = 1000
@@ -43,7 +45,38 @@ RITMO_EXEC = [
 
 
 # Popular o sistema com dados basicos
+async def worker(semaphore, client, url, json, results, id_register):
+    async with semaphore:
+        response = await client.post(
+            url,
+            json=json
+        )
+        results.append(response[id_register]) 
+        return response.status_code
 
+async def preload(jsons, url, id_register, ids):
+    semaphore = asyncio.Semaphore(CONCURRENCY)
+    results = []
+
+    async with httpx.AsyncClient() as client:
+        tasks = [
+            worker(semaphore, client, url, json, results, id_register)
+            for json in jsons
+        ]
+        await asyncio.gather(*tasks)
+    ids.append(results)
+    
+data = gerar_dados_falsos( # clientes, restaurantes, entregadores
+    numero_de_clientes=N_CLIENTES, 
+    numero_de_restaurantes=N_RESTAURANTES, 
+    numero_de_entregadores=N_ENTREGADORES
+)
+
+ids = []
+for jsons, path, id_register in zip(data, ["/clientes", "/restaurantes", "/entregadores"], ["id_cliente", "id_restaurante", "id_entregador"]):
+    asyncio.run(preload(jsons, URL+path, id_register, ids))
+
+clientes, restaurantes, entregadores = ids
 
 # Cliente pode consultar o status do pedido (estado, entregador e posicao)
 # API deve responder em menos de 500ms no 95 percentil
@@ -58,12 +91,12 @@ async def requester(queue, results):
             method = item["method"]
             try:
                 start = time.perf_counter()
-                if item["method"] == "GET":
+                if method == "GET":
                     response = await client.get(
                         item["url"],
-                        params=item.get("params")
+                        # params=item.get("params")
                     )
-                elif item["method"] == "POST":
+                elif method == "POST":
                     response = await client.post(
                         item["url"],
                         json=item.get("json")
@@ -105,10 +138,15 @@ async def producer_order(queue, volume, duration, ritmo_idx):
             orders.append(order_id)
             orders_acum += 1
 
+        # Escolhe aleatoriamente um cliente e um restaurante
+        id_cli = random.choice(clientes)
+        id_res = random.choice(restaurantes)
+        json = {"id_cliente": id_cli, "id_restaurante": id_res, "lista_itens": []}
+        
         await queue.put({
             "method": "POST",
-            "url": URL,
-            "json": {"id_pedido": order_id}, 
+            "url": f"{URL}/pedidos",
+            "json": json, 
             "ritmo_idx": ritmo_idx
         })
 
@@ -136,8 +174,8 @@ async def viewer_order(queue, duration, ritmo_idx):
             
             await queue.put({
                 "method": "GET",
-                "url": URL,
-                "params": {"id_pedido": order_id}, 
+                "url": f"{URL}/pedidos/{order_id}/acompanhamento",
+                "params": {}, 
                 "ritmo_idx": ritmo_idx
             })
         current_sec += 1
