@@ -39,8 +39,8 @@ class ClienteCreate(BaseModel):
     nome: str
     email: str
     telefone: str
-    latitude: str
-    longitude: str
+    latitude: float
+    longitude: float
 
 class Restaurante(SQLModel, table=True):
     __tablename__ = "restaurantes"
@@ -50,17 +50,11 @@ class Restaurante(SQLModel, table=True):
     latitude: float
     longitude: float
 
-class EntregadorCreate(BaseModel):
-    nome: str
-    tipo_veiculo: str
-    latitude_inicial: str
-    longitude_inicial: str
-
 class RestauranteCreate(BaseModel):
     nome: str
     tipo_cozinha: str
-    latitude: str
-    longitude: str
+    latitude: float
+    longitude: float
 
 class Entregador(SQLModel, table=True):
     __tablename__ = "entregadores"
@@ -70,6 +64,12 @@ class Entregador(SQLModel, table=True):
     status: str | None = Field(default="AVAILABLE") 
     latitude: float | None = None
     longitude: float | None = None
+
+class EntregadorCreate(BaseModel):
+    nome: str
+    tipo_veiculo: str
+    latitude_inicial: float
+    longitude_inicial: float
 
 class PosicaoUpdate(BaseModel):
     latitude: float
@@ -376,3 +376,23 @@ def atualizar_status_pedido(id_pedido: int, update_data: PedidoStatusUpdate, ses
         session.rollback()
         logger.error(f"Falha ao processar mudança de status do pedido {id_pedido}: {e}")
         raise HTTPException(status_code=500, detail="Erro interno de comunicação com os bancos de dados.")
+
+@app.get("/pedidos/{id_pedido}/historico")
+def historico_pedido(id_pedido: int):
+    # Administrador consultando histórico cronológico
+    try:
+        resposta = tabela_eventos.query(
+            # Busca todos os eventos que pertencem a este pedido
+            KeyConditionExpression=Key('id_pedido').eq(f"PEDIDO#{id_pedido}"),
+            # ScanIndexForward=True garante a ordem do mais antigo para o mais novo
+            ScanIndexForward=True 
+        )
+        itens = resposta.get('Items', [])
+        
+        if not itens:
+            raise HTTPException(status_code=404, detail="Nenhum histórico encontrado para este pedido.")
+            
+        return itens
+    except Exception as e:
+        logger.error(f"Erro ao buscar histórico do pedido {id_pedido}: {e}")
+        raise HTTPException(status_code=500, detail="Erro ao conectar com o histórico de eventos.")
