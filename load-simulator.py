@@ -47,6 +47,56 @@ RITMO_EXEC = [
 
 # Cliente pode consultar o status do pedido (estado, entregador e posicao)
 # API deve responder em menos de 500ms no 95 percentil
+async def producer_order(queue, volume, duration, ritmo_idx):
+    start = time.perf_counter()
+    orders_acum = 0
+
+    while time.perf_counter() - start < duration:
+        # Produz pedidos seguindo uma distribuicao de poisson
+        delta = random.expovariate(volume)
+        await asyncio.sleep(delta)
+
+        async with orders_lock:
+            order_id = orders_acum
+            orders.append(order_id)
+            orders_acum += 1
+
+        await queue.put({
+            "method": "POST",
+            "url": URL,
+            "json": {"id_pedido": order_id}, 
+            "ritmo_idx": ritmo_idx
+        })
+
+
+async def viewer_order(queue, duration, ritmo_idx):
+    start = time.perf_counter()
+    await asyncio.sleep(start + 1 - time.perf_counter())
+    current_sec = 1
+    
+    while time.perf_counter() - start < duration:
+        async with orders_lock:
+            current_orders = list(orders)
+        
+        if not current_orders:
+            await asyncio.sleep(0.01)
+            continue
+        
+        # Consulta todos os pedidos disponiveis no segundo atual de forma uniforme
+        times = sorted(start + current_sec + random.uniform(0, 1) for _ in current_orders)
+        for order_id, time_exec in zip(current_orders, times):
+            # Pula para o tempo sorteado para a execucao
+            delta = time_exec - time.perf_counter()
+            await asyncio.sleep(max(0, delta))
+            
+            await queue.put({
+                "method": "GET",
+                "url": URL,
+                "params": {"id_pedido": order_id}, 
+                "ritmo_idx": ritmo_idx
+            })
+        current_sec += 1
+
 orders = []
 orders_lock = asyncio.Lock()
 
@@ -66,7 +116,7 @@ async def main():
         duracao = ritmo["duracao"]
         producers = [
             asyncio.create_task(producer_order(queue, volume, duracao, idx)),
-            asyncio.create_task(view_order(queue, duracao, idx)),
+            asyncio.create_task(viewer_order(queue, duracao, idx)),
         ]
 
         start_ritmo = time.perf_counter()
