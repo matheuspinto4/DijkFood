@@ -55,6 +55,7 @@ async def requester(queue, results):
                 queue.task_done()
                 break
             ritmo_idx = item["ritmo_idx"]
+            method = item["method"]
             try:
                 start = time.perf_counter()
                 if item["method"] == "GET":
@@ -72,7 +73,8 @@ async def requester(queue, results):
                 results.append({
                     "status": response.status_code,
                     "latency": latency,
-                    "ritmo_idx": ritmo_idx
+                    "ritmo_idx": ritmo_idx,
+                    "method": method
                 })
 
             except Exception as e:
@@ -82,7 +84,8 @@ async def requester(queue, results):
                     "status": "error",
                     "latency": latency,
                     "error": str(e),
-                    "ritmo_idx": ritmo_idx
+                    "ritmo_idx": ritmo_idx,
+                    "method": method
                 })
 
             queue.task_done()
@@ -115,7 +118,8 @@ async def viewer_order(queue, duration, ritmo_idx):
     await asyncio.sleep(start + 1 - time.perf_counter())
     current_sec = 1
     
-    while time.perf_counter() - start < duration:
+    # Comeca no final do primeiro segundo e termina no final do ultimo (depois da criacao do ultimo pedido)
+    while time.perf_counter() - start < duration + 1:
         async with orders_lock:
             current_orders = list(orders)
         
@@ -170,22 +174,22 @@ async def main():
 
     await asyncio.gather(*requesters)
     
-    
     def percentil(data, p):
         data_sorted = sorted(data)
         k = int(len(data_sorted) * p / 100)
         return data_sorted[min(k, len(data_sorted) - 1)]
 
-    latencias = {i: [] for i in range(len(RITMO_EXEC))}
+    # Separa as latencias de leitura e escrita
+    latencias = {i: {"POST": [], "GET": []} for i in range(len(RITMO_EXEC))}
     for r in results:
         ritmo_idx = r["ritmo_idx"]
         latency = r["latency"]
-        latencias[ritmo_idx].append(latency)
+        method = r["method"]
+        latencias[ritmo_idx][method].append(latency)
 
-
+    # Metricas
     print("\n===== RESULTADOS =====")
     print(f"Total de requisições: {len(results)}")
-
     print("\nLatência:")
     
     metrics = {
@@ -195,10 +199,15 @@ async def main():
         "P95": lambda x: percentil(x, 95), 
         "Max": max,
     }
-    print(f"|{'Volume':^20}|", *[f"{metric:^10}|" for metric in metrics.keys()])
-    for ritmo_idx, latencia in latencias.items():
+    seccion = "-" * (len(metrics) * 12 + 32)
+    print(f"|{'Volume':^30}|", *[f"{metric:^10}|" for metric in metrics.keys()])
+    print(seccion)
+    for ritmo_idx, ritmo_latencia in latencias.items():
         ritmo_name = RITMO_EXEC[ritmo_idx]["volume"]
-        print(f"| {str(ritmo_idx + 1)+'. '+ritmo_name:<19}|", *[f"{round(f(latencia), 4):^10}|" for f in metrics.values()])
+        prefixos = [f"{ritmo_idx+1}. {ritmo_name}", ""]
+        for prefix, sufix, latencia in zip(prefixos, ritmo_latencia.keys(), ritmo_latencia.values()):
+            print(f"| {prefix:<19}", f"{sufix:>9}|", *[f"{round(f(latencia), 4) if latencia != [] else '':^10}|" for f in metrics.values()])
+        print(seccion)
     
     
 if __name__ == "__main__":
