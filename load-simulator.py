@@ -64,19 +64,7 @@ async def preload(jsons, url, id_register, ids):
             for json in jsons
         ]
         await asyncio.gather(*tasks)
-    ids.append(results)
-    
-data = gerar_dados_falsos( # clientes, restaurantes, entregadores
-    numero_de_clientes=N_CLIENTES, 
-    numero_de_restaurantes=N_RESTAURANTES, 
-    numero_de_entregadores=N_ENTREGADORES
-)
-
-ids = []
-for jsons, path, id_register in zip(data, ["/clientes", "/restaurantes", "/entregadores"], ["id_cliente", "id_restaurante", "id_entregador"]):
-    asyncio.run(preload(jsons, URL+path, id_register, ids))
-
-clientes, restaurantes, entregadores = ids
+    ids[id_register] = results
 
 # Cliente pode consultar o status do pedido (estado, entregador e posicao)
 # API deve responder em menos de 500ms no 95 percentil
@@ -124,7 +112,7 @@ async def requester(queue, results):
             queue.task_done()
             
 
-async def producer_order(queue, volume, duration, ritmo_idx):
+async def producer_order(queue, volume, duration, ritmo_idx, clientes, restaurantes):
     start = time.perf_counter()
     orders_acum = 0
 
@@ -184,6 +172,26 @@ orders = []
 orders_lock = asyncio.Lock()
 
 async def main():
+    data = gerar_dados_falsos( # clientes, restaurantes, entregadores
+        numero_de_clientes=N_CLIENTES, 
+        numero_de_restaurantes=N_RESTAURANTES, 
+        numero_de_entregadores=N_ENTREGADORES
+    )
+
+    ids = {}
+    tasks = [
+        preload(jsons, URL + path, id_register, ids)
+        for jsons, path, id_register in zip(
+            data,
+            ["/clientes", "/restaurantes", "/entregadores"],
+            ["id_cliente", "id_restaurante", "id_entregador"]
+        )
+    ]
+
+    await asyncio.gather(*tasks)
+    clientes = ids["id_cliente"]
+    restaurantes = ids["id_restaurante"]
+    
     queue = asyncio.Queue()
     results = []
 
@@ -198,7 +206,7 @@ async def main():
         volume = VOLUMES[ritmo["volume"]]
         duracao = ritmo["duracao"]
         producers = [
-            asyncio.create_task(producer_order(queue, volume, duracao, idx)),
+            asyncio.create_task(producer_order(queue, volume, duracao, idx, clientes, restaurantes)),
             asyncio.create_task(viewer_order(queue, duracao, idx)),
         ]
 
