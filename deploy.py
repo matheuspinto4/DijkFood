@@ -5,64 +5,25 @@ Criado para o projeto DijkFood
 Restrito aos recursos exigidos: EC2, RDS, DynamoDB, ECS, S3.
 
 Lifecycle:
-  1. allocate   — Cria todos os recursos de rede, banco e computação
-  2. populate   — Injeta dados (Faker) no RDS/DDB e gera/faz upload do Grafo no S3
+  1. allocate   — Cria toda a infraestrutura e as tabelas vazias no Banco de Dados
+  2. populate   — Baixa o Grafo Viário (OSMnx) e envia para o S3
   3. destroy    — Apaga rigorosamente TODOS os recursos
 
 Usage:
-  python deploy_dijkfood.py                           # Cria, popula e APAGA em seguida
-  python deploy_dijkfood.py --step allocate           # Apenas cria a infraestrutura
-  python deploy_dijkfood.py --step populate           # Apenas conecta e popula os dados
+  python deploy_dijkfood.py                           # Cria, popula o S3 e APAGA em seguida
+  python deploy_dijkfood.py --step allocate           # Cria a infraestrutura e o schema vazio
+  python deploy_dijkfood.py --step populate           # Envia o Grafo para o S3
   python deploy_dijkfood.py --step destroy            # Apaga toda a infraestrutura
 """
 
 import argparse
 import boto3
 import psycopg2
-import psycopg2.extras
-import random
 import time
-import uuid
 import csv
 import os
 import osmnx as ox
-from decimal import Decimal
 from botocore.exceptions import ClientError
-from datetime import datetime, timedelta
-
-from faker import Faker
-from faker.providers import BaseProvider
-
-# ── Custom Faker Provider (RDS) ────────────────────────────────────────────────
-class RestauranteProvider(BaseProvider):
-    tipos_culinaria = [
-        'Pizzaria', 'Churrascaria', 'Comida Japonesa', 'Comida Mineira', 
-        'Comida Baiana', 'Lanchonete', 'Hamburgueria', 'Cantina Italiana', 
-        'Comida Vegana', 'Bistrô Francês', 'Frutos do Mar'
-    ]
-    prefixos = ['Restaurante', 'Cantina', 'Pizzaria', 'Bar e Petiscaria', 'Recanto', 'Espaço']
-    sufixos = ['Gourmet', 'da Família', 'Tradicional', 'Express', 'Saboroso', 'Grill']
-
-    def tipo_restaurante(self):
-        return self.random_element(self.tipos_culinaria)
-
-    def nome_restaurante(self):
-        formato = random.choice(['nome_pessoa', 'prefixo_sufixo', 'sobrenome'])
-        if formato == 'nome_pessoa':
-            artigo = self.random_element(['do', 'da'])
-            nome = self.generator.first_name()
-            estabelecimento = self.random_element(['Bar', 'Restaurante', 'Cantina', 'Lanchonete'])
-            return f"{estabelecimento} {artigo} {nome}"
-        elif formato == 'prefixo_sufixo':
-            return f"{self.random_element(self.prefixos)} {self.random_element(self.sufixos)}"
-        else:
-            estabelecimento = self.random_element(self.prefixos)
-            sobrenome = self.generator.last_name()
-            return f"{estabelecimento} {sobrenome}"
-
-def get_lat_lon(): 
-    return random.uniform(-23.7, -23.4), random.uniform(-46.8, -46.3)
-
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 REGION         = "us-east-1"
@@ -82,13 +43,6 @@ DB_PORT        = 5432
 INSTANCE_CLASS = "db.t3.micro"
 PG_VERSION     = "16"
 PG_GROUP_NAME  = "dijkfood-pg16"   
-
-# Dados
-N_CLIENTES     = 1000
-N_RESTAURANTES = 50
-N_ENTREGADORES = 3000
-N_PEDIDOS      = 50000
-N_DDB_ITEMS    = 50000
 
 # Configurações DynamoDB
 DDB_TABLE_EVENTOS    = "dijkfood-historico-eventos"
@@ -111,7 +65,7 @@ API_PORT         = 80 # A porta que o container vai escutar
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 1. ARQUITETURA
+# ARQUITETURA
 # ─────────────────────────────────────────────────────────────────────────────
 
 class Arquitetura:
@@ -148,6 +102,9 @@ class Arquitetura:
         
         # 3. Cria o ECS injetando o Endpoint do RDS e nomes das tabelas do DDB
         self.allocate_ecs_and_alb()
+
+        # 4. Conecta no RDS e cria as tabelas vazias (Schema)
+        self.create_rds_schema()
 
     def create_security_groups(self):
         vpcs = self.ec2.describe_vpcs(Filters=[{"Name": "isDefault", "Values": ["true"]}])
@@ -213,6 +170,57 @@ class Arquitetura:
         self.rds.get_waiter("db_instance_available").wait(DBInstanceIdentifier=DB_INSTANCE_ID, WaiterConfig={"Delay": 30, "MaxAttempts": 40})
         self.rds_endpoint = self.rds.describe_db_instances(DBInstanceIdentifier=DB_INSTANCE_ID)["DBInstances"][0]["Endpoint"]["Address"]
         print(f"[RDS] Pronto! Endpoint: {self.rds_endpoint}")
+
+    def create_rds_schema(self):
+        print(f"\n[RDS] Conectando para criar tabelas vazias (Schema)...")
+        conn = None
+        for attempt in range(1, 7):
+            try:
+                conn = psycopg2.connect(host=self.rds_endpoint, port=DB_PORT, dbname=DB_NAME, user=DB_ADMIN_USER, password=DB_PASSWORD, connect_timeout=10)
+                break
+            except psycopg2.OperationalError as exc:
+                if attempt == 6: raise
+                print(f"      Tentativa {attempt}/6 falhou. Retentando em 10s...")
+                time.sleep(10)
+        
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS clientes (
+                    id_cliente SERIAL PRIMARY KEY,
+                    nome VARCHAR(80),
+                    email VARCHAR(80),
+                    telefone VARCHAR(20),
+                    latitude DOUBLE PRECISION,
+                    longitude DOUBLE PRECISION
+                );
+                CREATE TABLE IF NOT EXISTS restaurantes (
+                    id_restaurante SERIAL PRIMARY KEY,
+                    nome VARCHAR(80),
+                    tipo_cozinha VARCHAR(40),
+                    latitude DOUBLE PRECISION,
+                    longitude DOUBLE PRECISION
+                );
+                CREATE TABLE IF NOT EXISTS entregadores (
+                    id_entregador SERIAL PRIMARY KEY,
+                    nome VARCHAR(80),
+                    tipo_veiculo VARCHAR(30),
+                    status VARCHAR(30),
+                    latitude DOUBLE PRECISION,
+                    longitude DOUBLE PRECISION
+                );
+                CREATE TABLE IF NOT EXISTS pedidos (
+                    id_pedido SERIAL PRIMARY KEY,
+                    id_cliente INT REFERENCES clientes(id_cliente),
+                    id_restaurante INT REFERENCES restaurantes(id_restaurante),
+                    id_entregador INT REFERENCES entregadores(id_entregador),
+                    lista_itens TEXT,
+                    data DATE,
+                    horario TIME
+                );
+            """)
+        conn.commit()
+        conn.close()
+        print("[RDS] Tabelas criadas com sucesso (Preparadas para o Simulador)!")
     
     def allocate_ec2(self):
         ssm = boto3.client("ssm", region_name=REGION)
@@ -339,6 +347,46 @@ class Arquitetura:
 
         print(f"\n[ALB] URL da sua API: http://{self.elbv2.describe_load_balancers(Names=[ALB_NAME])['LoadBalancers'][0]['DNSName']}")
 
+    # ─────────────────────────────────────────────────────────────────────────────
+    # POPULATE (Apenas o S3, o Simulador assume o resto)
+    # ─────────────────────────────────────────────────────────────────────────────
+
+    def populate_graph_s3(self):
+        print(f"\n--- Baixando Grafo OSMnx e enviando para S3 ---")
+        
+        edges_file = "graph_edges.csv"
+        nodes_file = "graph_nodes.csv"
+        
+        if not os.path.exists(edges_file):
+            print(f"[OSMnx] Baixando a rede '{NETWORK_TYPE}' para '{PLACE_NAME}' (Pode levar alguns minutos)...")
+            graph = ox.graph_from_place(PLACE_NAME, network_type=NETWORK_TYPE)
+            
+            seen_edges = {}
+            for u, v, data in graph.edges(data=True):
+                w = float(data.get("length", 1.0))
+                key = (u, v)
+                if key not in seen_edges or w < seen_edges[key]:
+                    seen_edges[key] = w
+
+            with open(edges_file, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(["from_node", "to_node", "weight"])
+                for (u, v), w in sorted(seen_edges.items()):
+                    writer.writerow([u, v, f"{w:.4f}"])
+
+            with open(nodes_file, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(["node_id", "lat", "lon"])
+                for n, data in graph.nodes(data=True):
+                    writer.writerow([n, data['y'], data['x']])
+            print(f"[OSMnx] Arquivos CSV gerados localmente.")
+        else:
+            print("[OSMnx] Arquivos locais encontrados. Pulando download.")
+
+        print(f"[S3] Fazendo upload para s3://{S3_BUCKET_NAME}/")
+        self.s3.upload_file(edges_file, S3_BUCKET_NAME, edges_file)
+        self.s3.upload_file(nodes_file, S3_BUCKET_NAME, nodes_file)
+        print("[S3] Upload concluído!")
 
     # ─────────────────────────────────────────────────────────────────────────────
     # TEARDOWN (Limpeza Segura de Custos)
@@ -409,122 +457,6 @@ class Arquitetura:
                     self.ec2.delete_security_group(GroupId=sgs["SecurityGroups"][0]["GroupId"])
             except ClientError: pass
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 2. POPULATE (Geração Fake de Dados Iniciais)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def connect(endpoint, user=DB_ADMIN_USER, password=DB_PASSWORD, retries=6, delay=10):
-    for attempt in range(1, retries + 1):
-        try:
-            conn = psycopg2.connect(host=endpoint, port=DB_PORT, dbname=DB_NAME, user=user, password=password, connect_timeout=10)
-            print(f"[DB]  Connected  host={endpoint}  user={user}")
-            return conn
-        except psycopg2.OperationalError as exc:
-            if attempt == retries: raise
-            print(f"[DB]  Attempt {attempt}/{retries}: {exc}. Retrying in {delay}s ...")
-            time.sleep(delay)
-
-def populate_rds(conn):
-    print("\n--- Populando RDS (PostgreSQL) ---")
-    with conn.cursor() as cur:
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS clientes (id_cliente SERIAL PRIMARY KEY, nome VARCHAR(80), email VARCHAR(80), telefone VARCHAR(20), latitude DOUBLE PRECISION, longitude DOUBLE PRECISION);
-            CREATE TABLE IF NOT EXISTS restaurantes (id_restaurante SERIAL PRIMARY KEY, nome VARCHAR(80), tipo_cozinha VARCHAR(40), latitude DOUBLE PRECISION, longitude DOUBLE PRECISION);
-            CREATE TABLE IF NOT EXISTS entregadores (id_entregador SERIAL PRIMARY KEY, nome VARCHAR(80), tipo_veiculo VARCHAR(30), latitude_inicial DOUBLE PRECISION, longitude_inicial DOUBLE PRECISION, status_ocupado BOOLEAN DEFAULT FALSE);
-            CREATE TABLE IF NOT EXISTS pedidos (id_pedido SERIAL PRIMARY KEY, id_cliente INT REFERENCES clientes(id_cliente), id_restaurante INT REFERENCES restaurantes(id_restaurante), id_entregador INT REFERENCES entregadores(id_entregador), valor NUMERIC(8,2), data_criacao TIMESTAMP);
-            CREATE INDEX IF NOT EXISTS idx_entregador ON entregadores(status_ocupado) WHERE status_ocupado = FALSE;
-        """)
-        
-        fake = Faker(['pt-BR'])
-        fake.add_provider(RestauranteProvider)
-
-        print(f"Gerando {N_CLIENTES} clientes, {N_RESTAURANTES} restaurantes, {N_ENTREGADORES} entregadores...")
-        clientes = [(fake.name(), fake.email(), fake.phone_number(), *get_lat_lon()) for _ in range(N_CLIENTES)]
-        restaurantes = [(fake.nome_restaurante(), fake.tipo_restaurante(), *get_lat_lon()) for _ in range(N_RESTAURANTES)]
-        entregadores = [(fake.name(), random.choice(["moto", "carro", "biscicleta"]), *get_lat_lon(), False) for _ in range(N_ENTREGADORES)]
-
-        psycopg2.extras.execute_values(cur, "INSERT INTO clientes (nome, email, telefone, latitude, longitude) VALUES %s", clientes, page_size=500)
-        psycopg2.extras.execute_values(cur, "INSERT INTO restaurantes (nome, tipo_cozinha, latitude, longitude) VALUES %s", restaurantes, page_size=100)
-        psycopg2.extras.execute_values(cur, "INSERT INTO entregadores (nome, tipo_veiculo, latitude_inicial, longitude_inicial, status_ocupado) VALUES %s", entregadores, page_size=2000)
-
-        cur.execute("SELECT id_cliente FROM clientes"); clientes_ids = [r[0] for r in cur.fetchall()]
-        cur.execute("SELECT id_restaurante FROM restaurantes"); rest_ids = [r[0] for r in cur.fetchall()]
-        cur.execute("SELECT id_entregador FROM entregadores"); ent_ids = [r[0] for r in cur.fetchall()]
-
-        print(f"Gerando {N_PEDIDOS} pedidos históricos...")
-        batch, base_date = [], datetime(2023, 1, 1)
-        for i in range(N_PEDIDOS):
-            data_pedido = base_date + timedelta(days=random.randint(0, 365), hours=random.randint(0,23))
-            # Notar que o `id_entregador` na fila e logica de worker ficará dinâmico, mas os falsos já tem um fixo para popular:
-            batch.append((random.choice(clientes_ids), random.choice(rest_ids), random.choice(ent_ids), round(random.uniform(15.0, 250.0), 2), data_pedido.isoformat()))
-            if len(batch) == 5000:
-                psycopg2.extras.execute_values(cur, "INSERT INTO pedidos (id_cliente, id_restaurante, id_entregador, valor, data_criacao) VALUES %s", batch, page_size=2000)
-                batch = []; print(f"  {i + 1:,}/{N_PEDIDOS:,} pedidos inseridos ...")
-        if batch: psycopg2.extras.execute_values(cur, "INSERT INTO pedidos (id_cliente, id_restaurante, id_entregador, valor, data_criacao) VALUES %s", batch, page_size=2000)
-    conn.commit()
-
-def populate_dynamodb(ddb):
-    print(f"\n--- Populando DynamoDB (NoSQL) ---")
-    tb_eventos = ddb.Table(DDB_TABLE_EVENTOS)
-    tb_telemetria = ddb.Table(DDB_TABLE_TELEMETRIA)
-    base_ts = datetime.now() - timedelta(days=30)
-    
-    print(f"[DDB] Injetando {N_DDB_ITEMS:,} logs de eventos...")
-    with tb_eventos.batch_writer() as batch:
-        for i in range(N_DDB_ITEMS):
-            batch.put_item(Item={
-                "id_pedido": f"PEDIDO#{random.randint(1, N_PEDIDOS)}", "timestamp": (base_ts + timedelta(minutes=i)).isoformat(),
-                "status": random.choice(["criado", "preparando", "saiu_para_entrega", "entregue"]), "event_id": uuid.uuid4().hex[:8]
-            })
-
-    print(f"[DDB] Injetando {N_DDB_ITEMS:,} pontos de telemetria...")
-    with tb_telemetria.batch_writer() as batch:
-        for i in range(N_DDB_ITEMS):
-            lat, lon = get_lat_lon()
-            batch.put_item(Item={
-                "id_entregador": f"ENTREGADOR#{random.randint(1, N_ENTREGADORES)}", "timestamp": (base_ts + timedelta(seconds=i*30)).isoformat(),
-                "latitude": Decimal(str(round(lat, 6))), "longitude": Decimal(str(round(lon, 6))), "bateria": Decimal(str(random.randint(10, 100)))
-            })
-
-def populate_graph_s3(s3):
-    print(f"\n--- Baixando Grafo OSMnx e enviando para S3 ---")
-    
-    edges_file = "graph_edges.csv"
-    nodes_file = "graph_nodes.csv"
-    
-    if not os.path.exists(edges_file):
-        print(f"[OSMnx] Baixando a rede '{NETWORK_TYPE}' para '{PLACE_NAME}' (Pode levar alguns minutos)...")
-        graph = ox.graph_from_place(PLACE_NAME, network_type=NETWORK_TYPE)
-        
-        seen_edges = {}
-        for u, v, data in graph.edges(data=True):
-            w = float(data.get("length", 1.0))
-            key = (u, v)
-            if key not in seen_edges or w < seen_edges[key]:
-                seen_edges[key] = w
-
-        with open(edges_file, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(["from_node", "to_node", "weight"])
-            for (u, v), w in sorted(seen_edges.items()):
-                writer.writerow([u, v, f"{w:.4f}"])
-
-        with open(nodes_file, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(["node_id", "lat", "lon"])
-            for n, data in graph.nodes(data=True):
-                writer.writerow([n, data['y'], data['x']])
-        print(f"[OSMnx] Arquivos CSV gerados localmente.")
-    else:
-        print("[OSMnx] Arquivos locais encontrados. Pulando download.")
-
-    print(f"[S3] Fazendo upload para s3://{S3_BUCKET_NAME}/")
-    s3.upload_file(edges_file, S3_BUCKET_NAME, edges_file)
-    s3.upload_file(nodes_file, S3_BUCKET_NAME, nodes_file)
-    print("[S3] Upload concluído!")
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # ENTRY POINT
 # ─────────────────────────────────────────────────────────────────────────────
@@ -540,20 +472,7 @@ def main():
         arquitetura.allocate()
 
     if args.step in ("all", "populate"):
-        try:
-            print(f"\n[RDS] Aguardando o banco ficar 'Available' para recuperar o Endpoint...")
-            arquitetura.rds.get_waiter("db_instance_available").wait(DBInstanceIdentifier=DB_INSTANCE_ID, WaiterConfig={"Delay": 30, "MaxAttempts": 40})
-            
-            endpoint = arquitetura.rds.describe_db_instances(DBInstanceIdentifier=DB_INSTANCE_ID)["DBInstances"][0]["Endpoint"]["Address"]
-            conn = connect(endpoint)
-            if conn:
-                populate_rds(conn)
-                conn.close()
-        except Exception as e:
-            print(f"Não foi possível popular RDS: {e}")
-        
-        populate_dynamodb(arquitetura.ddb)
-        populate_graph_s3(arquitetura.s3)
+        arquitetura.populate_graph_s3()
 
     if args.step in ("all", "destroy"):
         arquitetura.destroy()
