@@ -1,5 +1,5 @@
 """
-deploy_dijkfood.py — Full Architecture Deployment (RDS Multi-AZ, DDB, S3, EC2 HA, ECS Auto-Scaled)
+deploy.py — Full Architecture Deployment (RDS Multi-AZ, DDB, S3, EC2 HA, ECS Auto-Scaled)
 Criado para o projeto DijkFood
 
 Restrito aos recursos exigidos: EC2, RDS, DynamoDB, ECS, S3.
