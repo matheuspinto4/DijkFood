@@ -275,6 +275,17 @@ def criar_pedido(pedido_in: PedidoCreate, session: SessionDep):
         )
         session.add(novo_pedido)
 
+        session.flush()
+
+        tabela_eventos.put_item(
+            Item={
+                "id_pedido": f"PEDIDO#{novo_pedido.id_pedido}",
+                "timestamp": datetime.utcnow().isoformat(),
+                "status": novo_pedido.status, # Que por padrão é "CONFIRMED"
+                "event_id": uuid.uuid4().hex[:8]
+            }
+        )
+        
         # Só salva se der tudo certo 
         session.commit()
         session.refresh(novo_pedido)
