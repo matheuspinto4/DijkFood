@@ -2,10 +2,14 @@ import logging
 import os
 import uuid
 import boto3
+import json
 from enum import Enum
 from datetime import datetime
 from typing import Annotated
 
+from datetime import date, time as datetime_time
+from sqlmodel import Field, SQLModel
+from boto3.dynamodb.conditions import Key
 from pydantic import BaseModel
 from fastapi import Depends, FastAPI, HTTPException, Query
 from sqlmodel import Field, Session, SQLModel, create_engine, select
@@ -15,6 +19,8 @@ DYNAMODB_REGION = os.getenv("AWS_REGION", "us-east-1")
 dynamodb = boto3.resource("dynamodb", region_name=DYNAMODB_REGION)
 NOME_TABELA_EVENTOS = os.getenv("DDB_EVENTOS", "dijkfood-historico-eventos")
 tabela_eventos = dynamodb.Table(NOME_TABELA_EVENTOS)
+NOME_TABELA_TELEMETRIA = os.getenv("DDB_TELEMETRIA", "dijkfood-telemetria-entregadores")
+tabela_telemetria = dynamodb.Table(NOME_TABELA_TELEMETRIA)
 
 # Configuração de logs para monitorar a API na nuvem
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -29,6 +35,13 @@ class Cliente(SQLModel, table=True):
     latitude: float
     longitude: float
 
+class ClienteCreate(BaseModel):
+    nome: str
+    email: str
+    telefone: str
+    latitude: str
+    longitude: str
+
 class Restaurante(SQLModel, table=True):
     __tablename__ = "restaurantes"
     id_restaurante: int | None = Field(default=None, primary_key=True)
@@ -37,14 +50,30 @@ class Restaurante(SQLModel, table=True):
     latitude: float
     longitude: float
 
+class EntregadorCreate(BaseModel):
+    nome: str
+    tipo_veiculo: str
+    latitude_inicial: str
+    longitude_inicial: str
+
+class RestauranteCreate(BaseModel):
+    nome: str
+    tipo_cozinha: str
+    latitude: str
+    longitude: str
+
 class Entregador(SQLModel, table=True):
     __tablename__ = "entregadores"
     id_entregador: int | None = Field(default=None, primary_key=True)
     nome: str
     tipo_veiculo: str
-    latitude_inicial: float
-    longitude_inicial: float
-    status_ocupado: bool = Field(default=False)
+    status: str | None = Field(default="AVAILABLE") 
+    latitude: float | None = None
+    longitude: float | None = None
+
+class PosicaoUpdate(BaseModel):
+    latitude: float
+    longitude: float
 
 class StatusPedido(str, Enum):
     CONFIRMED = "CONFIRMED"
@@ -71,13 +100,15 @@ class Pedido(SQLModel, table=True):
     id_cliente: int = Field(foreign_key="clientes.id_cliente")
     id_restaurante: int = Field(foreign_key="restaurantes.id_restaurante")
     id_entregador: int = Field(foreign_key="entregadores.id_entregador")
-    lista_itens: str | None = None 
-    status: str = Field(default=StatusPedido.CONFIRMED.value) 
-    data_criacao: datetime = Field(default_factory=datetime.now)
+    lista_itens: str | None = None
+    status: str = Field(default="CONFIRMED")
+    data: date | None = None
+    horario: datetime_time | None = None
 
 class PedidoCreate(BaseModel):
     id_cliente: int
     id_restaurante: int
+    lista_itens: list[dict]
 
 # Conexão com a AWS
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -95,13 +126,107 @@ app = FastAPI(title="DijkFood API - Produção")
 def listar_clientes(session: SessionDep, offset: int = 0, limit: int = 10):
     return session.exec(select(Cliente).offset(offset).limit(limit)).all()
 
+@app.post("/clientes/", response_model=Cliente)
+def criar_cliente(cliente_in: ClienteCreate, session: SessionDep):
+    logger.info(f"Iniciando criação do cliente {cliente_in.nome}")
+
+    try:
+        novo_cliente = Cliente(
+                nome = cliente_in.nome,
+                email = cliente_in.email,
+                telefone = cliente_in.telefone,
+                latitude = cliente_in.latitude,
+                longitude = cliente_in.longitude
+        )
+        session.add(novo_cliente)
+
+        # Só salva se der tudo certo 
+        session.commit()
+        session.refresh(novo_cliente)
+
+        logger.info(f"Cliente {novo_cliente.id_cliente} criado com sucesso!")
+        return novo_cliente
+
+    except Exception as e:
+        session.rollback() # Desfaz qualquer mudança parcial em caso de erro
+        logger.error(f"Erro atômico ao criar cliente: {e}")
+        raise HTTPException(status_code=500, detail="Erro interno ao processar o cliente")
+
 @app.get("/restaurantes/", response_model=list[Restaurante])
 def listar_restaurantes(session: SessionDep, offset: int = 0, limit: int = 10):
     return session.exec(select(Restaurante).offset(offset).limit(limit)).all()
 
+@app.post("/restaurantes/", response_model=Restaurante)
+def criar_restaurante(restaurante_in: RestauranteCreate, session: SessionDep):
+    logger.info(f"Iniciando criação do restaurante {restaurante_in.nome}")
+
+    try:
+        novo_restaurante = Restaurante(
+                nome = restaurante_in.nome,
+                tipo_cozinha = restaurante_in.tipo_cozinha,
+                latitude = restaurante_in.latitude,
+                longitude = restaurante_in.longitude
+        )
+        session.add(novo_restaurante)
+
+        # Só salva se der tudo certo 
+        session.commit()
+        session.refresh(novo_restaurante)
+
+        logger.info(f"Restaurante {novo_restaurante.id_restaurante} criado com sucesso!")
+        return novo_restaurante
+
+    except Exception as e:
+        session.rollback() # Desfaz qualquer mudança parcial em caso de erro
+        logger.error(f"Erro atômico ao criar restaurante: {e}")
+        raise HTTPException(status_code=500, detail="Erro interno ao processar o restaurante")
+
 @app.get("/entregadores/", response_model=list[Entregador])
 def listar_entregadores(session: SessionDep, offset: int = 0, limit: int = 10):
     return session.exec(select(Entregador).offset(offset).limit(limit)).all()
+
+@app.post("/entregadores/", response_model=Entregador)
+def criar_entregador(entregador_in: EntregadorCreate, session: SessionDep):
+    logger.info(f"Iniciando criação do entregador {entregador_in.nome}")
+
+    try:
+        novo_entregador = Entregador(
+                nome = entregador_in.nome,
+                tipo_veiculo = entregador_in.tipo_veiculo,
+                latitude_inicial = entregador_in.latitude_inicial,
+                longitude_inicial = entregador_in.longitude_inicial
+        )
+        session.add(novo_entregador)
+
+        # Só salva se der tudo certo 
+        session.commit()
+        session.refresh(novo_entregador)
+
+        logger.info(f"Entregador {novo_entregador.id_entregador} criado com sucesso!")
+        return novo_entregador
+
+    except Exception as e:
+        session.rollback() # Desfaz qualquer mudança parcial em caso de erro
+        logger.error(f"Erro atômico ao criar entregador: {e}")
+        raise HTTPException(status_code=500, detail="Erro interno ao processar o entregador") 
+
+@app.post("/entregadores/{id_entregador}/posicao")
+def atualizar_posicao(id_entregador: int, posicao: PosicaoUpdate):
+    try:
+        tabela_telemetria.put_item(
+            Item={
+                # O deploy.py definiu essa chave como String (S)
+                "id_entregador": str(id_entregador), 
+                "timestamp": datetime.utcnow().isoformat(),
+                # Convertendo para string para evitar problemas de float no DynamoDB
+                "latitude": str(posicao.latitude),
+                "longitude": str(posicao.longitude)
+            }
+        )
+        return {"status": "Posição recebida"}
+    except Exception as e:
+        logger.error(f"Erro ao salvar telemetria: {e}")
+        raise HTTPException(status_code=500, detail="Erro ao salvar posição")
 
 @app.get("/pedidos/", response_model=list[Pedido])
 def listar_pedidos(session: SessionDep, offset: int = 0, limit: int = 10):
@@ -129,25 +254,38 @@ def criar_pedido(pedido_in: PedidoCreate, session: SessionDep):
     if not restaurante:
         raise HTTPException(status_code=404, detail="Restaurante não encontrado")
 
-    # Busca o primeiro entregador disponível (status_ocupado = False)
+    # Busca o primeiro entregador disponível 
     entregador = session.exec(
-        select(Entregador).where(Entregador.status_ocupado == False)
+        select(Entregador).where(Entregador.status == "AVAILABLE")
     ).first()
 
     if not entregador:
         raise HTTPException(status_code=400, detail="Nenhum entregador disponível no momento")
 
     try:
-        entregador.status_ocupado = True
+        # 4. Muda o status do entregador para ocupado
+        entregador.status = "BUSY"
         session.add(entregador)
 
         novo_pedido = Pedido(
             id_cliente=cliente.id_cliente,
             id_restaurante=restaurante.id_restaurante,
-            id_entregador=entregador.id_entregador
+            id_entregador=entregador.id_entregador,
+            lista_itens=json.dumps(pedido_in.lista_itens)
         )
         session.add(novo_pedido)
 
+        session.flush()
+
+        tabela_eventos.put_item(
+            Item={
+                "id_pedido": f"PEDIDO#{novo_pedido.id_pedido}",
+                "timestamp": datetime.utcnow().isoformat(),
+                "status": novo_pedido.status, # Que por padrão é "CONFIRMED"
+                "event_id": uuid.uuid4().hex[:8]
+            }
+        )
+        
         # Só salva se der tudo certo 
         session.commit()
         session.refresh(novo_pedido)
@@ -159,7 +297,41 @@ def criar_pedido(pedido_in: PedidoCreate, session: SessionDep):
         session.rollback() # Desfaz qualquer mudança parcial em caso de erro
         logger.error(f"Erro atômico ao criar pedido: {e}")
         raise HTTPException(status_code=500, detail="Erro interno ao processar o pedido")
-    
+
+@app.get("/pedidos/{id_pedido}/acompanhamento")
+def acompanhar_pedido(id_pedido: int, session: SessionDep):
+    # 1. Busca o status atualizado no RDS
+    pedido = session.get(Pedido, id_pedido)
+    if not pedido:
+        raise HTTPException(status_code=404, detail="Pedido não encontrado")
+
+    # 2. Busca a última posição do entregador no DynamoDB
+    ultima_posicao = None
+    try:
+        resposta = tabela_telemetria.query(
+            KeyConditionExpression=Key('id_entregador').eq(str(pedido.id_entregador)),
+            ScanIndexForward=False, # Truque: Traz os dados de trás pra frente (o mais recente primeiro)
+            Limit=1 # Pega apenas a 1ª linha
+        )
+        itens = resposta.get('Items', [])
+        if itens:
+            ultima_posicao = {
+                "latitude": float(itens[0]["latitude"]),
+                "longitude": float(itens[0]["longitude"]),
+                "ultima_atualizacao": itens[0]["timestamp"]
+            }
+    except Exception as e:
+        logger.error(f"Erro ao buscar telemetria do entregador {pedido.id_entregador}: {e}")
+        # Não quebramos a requisição se o GPS falhar, apenas retornamos sem a posição
+
+    # 3. Junta tudo e devolve para o cliente
+    return {
+        "id_pedido": pedido.id_pedido,
+        "status": pedido.status,
+        "id_entregador": pedido.id_entregador,
+        "posicao_entregador": ultima_posicao
+    }
+
 @app.patch("/pedidos/{id_pedido}/status", response_model=Pedido)
 def atualizar_status_pedido(id_pedido: int, update_data: PedidoStatusUpdate, session: SessionDep):
     # 1. Busca o pedido no RDS
