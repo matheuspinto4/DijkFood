@@ -60,22 +60,56 @@ async def main():
         for _ in range(CONCURRENCY)
     ]
 
-    for ritmo in RITMO_EXEC:
+    for idx in range(len(RITMO_EXEC)):
+        ritmo = RITMO_EXEC[idx]
+        volume = VOLUMES[ritmo["volume"]]
+        duracao = ritmo["duracao"]
         producers = [
-            asyncio.create_task(producer_order(queue, ritmo["volume"], ritmo["duracao"])),
-            asyncio.create_task(view_order(queue, ritmo["duracao"])),
+            asyncio.create_task(producer_order(queue, volume, duracao, idx)),
+            asyncio.create_task(view_order(queue, duracao, idx)),
         ]
 
         start_ritmo = time.perf_counter()
-
         await asyncio.gather(*producers)
-
         await queue.join()
-
         ritmo_time = time.perf_counter() - start_ritmo
+        RITMO_EXEC[idx]["real_time"] = ritmo_time
+        
 
     # Finaliza requesters
     for _ in requesters:
         await queue.put(None)
 
     await asyncio.gather(*requesters)
+    
+    
+    def percentil(data, p):
+        data_sorted = sorted(data)
+        k = int(len(data_sorted) * p / 100)
+        return data_sorted[min(k, len(data_sorted) - 1)]
+
+    latencias = {i: [] for i in range(RITMO_EXEC)}
+    for r in results:
+        ritmo_idx = r["ritmo_idx"]
+        latency = r["latency"]
+        latencias[ritmo_idx].append(latency)
+
+
+    print("\n===== RESULTADOS =====")
+    print(f"Total de requisições: {len(results)}")
+
+    print("\nLatência:")
+    ritmos_names = [r["volume"] for r in RITMO_EXEC]
+    print(f"|{'Metrica':^10}|", *[f"{ritmo:^20}|"                                 for ritmo in ritmos_names])
+    print(f"|{'Min':^10}|",     *[f"{round(min(latencia), 4):^20}|"               for latencia in latencias.values()])
+    print(f"|{'Media':^10}|",   *[f"{round(statistics.mean(latencia), 4):^20}|"   for latencia in latencias.values()])
+    print(f"|{'Mediana':^10}|", *[f"{round(statistics.median(latencia), 4):^20}|" for latencia in latencias.values()])
+    print(f"|{'p95':^10}|",     *[f"{round(percentil(latencia, 95), 4):^20}|"     for latencia in latencias.values()])
+    print(f"|{'Máx':^10}|",     *[f"{round(max(latencia), 4):^20}|"               for latencia in latencias.values()])
+
+    ritmos_times = [r["real_time"] for r in RITMO_EXEC]
+    print(f"|{'Real time':^10}|", *[f"{total_time:^20}|" for total_time in ritmos_times])
+    
+    
+if __name__ == "__main__":
+    asyncio.run(main())
