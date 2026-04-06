@@ -1,8 +1,8 @@
 """
-deploy.py — Full Architecture Deployment (RDS Multi-AZ, DDB, S3, EC2 HA, ECS Auto-Scaled)
+deploy.py — Full Architecture Deployment (RDS Multi-AZ, DDB, S3, ECS API, ECS Worker)
 Criado para o projeto DijkFood
 
-Restrito aos recursos exigidos: EC2, RDS, DynamoDB, ECS, S3.
+Restrito aos recursos exigidos: EC2 (usado apenas para SGs/Rede), RDS, DynamoDB, ECS, S3.
 
 Lifecycle:
   1. allocate   — Cria toda a infraestrutura e as tabelas vazias no Banco de Dados
@@ -53,15 +53,11 @@ S3_BUCKET_NAME = f"dijkfood-grafo-sp-{ACCOUNT_ID}"
 PLACE_NAME     = "São Paulo, Brazil"
 NETWORK_TYPE   = "drive"
 
-# Configurações EC2
-EC2_INSTANCE_TYPE = "t3.micro"
-KEY_PAIR_NAME     = "vockey"
-
 # Configurações ECS
 ECS_CLUSTER_NAME = "DijkFoodCluster"
 ALB_NAME         = "dijkfood-api-alb"
 TG_NAME          = "dijkfood-api-tg"
-API_PORT         = 80 # A porta que o container vai escutar
+API_PORT         = 80 # A porta que o container da API vai escutar
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -70,6 +66,7 @@ API_PORT         = 80 # A porta que o container vai escutar
 
 class Arquitetura:
     def __init__(self):
+        # A API do EC2 continua aqui apenas para gerenciar as regras de Rede (Security Groups/VPC)
         self.rds, self.ec2, self.ddb, self.s3, self.ecs, self.elbv2, self.app_asg = self.get_clients()
         self.sgs = {}
         self.vpc_id = None
@@ -92,16 +89,15 @@ class Arquitetura:
         self.sgs, self.vpc_id = self.create_security_groups()
         self.pg_group = self.create_parameter_group()
         
-        # 1. Cria o RDS primeiro e aguarda para pegar o Endpoint (Necessário para o ECS)
+        # 1. Cria o RDS primeiro e aguarda para pegar o Endpoint
         self.allocate_rds()
         
-        # 2. Aloca os recursos independentes
-        self.allocate_ec2()
+        # 2. Aloca bancos NoSQL e Repositórios
         self.allocate_dynamodb()
         self.allocate_s3()
         
-        # 3. Cria o ECS injetando o Endpoint do RDS e nomes das tabelas do DDB
-        self.allocate_ecs_and_alb()
+        # 3. Cria os contêineres ECS (API + Worker) injetando o Endpoint do RDS
+        self.allocate_ecs_services()
 
         # 4. Conecta no RDS e cria as tabelas vazias (Schema)
         self.create_rds_schema()
@@ -125,20 +121,21 @@ class Arquitetura:
                 raise
             
         sgs['alb'] = get_or_create_sg("dijkfood-alb-sg", "SG para o Load Balancer (Aberto para Web)")
-        sgs['ecs'] = get_or_create_sg("dijkfood-ecs-sg", "SG para os Containers ECS (Recebe do ALB)")
-        sgs['ec2'] = get_or_create_sg("dijkfood-worker-sg", "SG para EC2 Worker (Dijkstra)")
+        sgs['api'] = get_or_create_sg("dijkfood-api-sg", "SG para os Containers ECS da API")
+        sgs['worker'] = get_or_create_sg("dijkfood-worker-sg", "SG para os Containers ECS do Worker")
         sgs['rds'] = get_or_create_sg("dijkfood-rds-sg", "SG para Banco RDS")
     
+        # Regras de Ingress
         try: self.ec2.authorize_security_group_ingress(GroupId=sgs['alb'], IpPermissions=[{"IpProtocol": "tcp", "FromPort": 80, "ToPort": 80, "IpRanges": [{"CidrIp": "0.0.0.0/0"}]}])
         except ClientError: pass
-        try: self.ec2.authorize_security_group_ingress(GroupId=sgs['ecs'], IpPermissions=[{"IpProtocol": "tcp", "FromPort": API_PORT, "ToPort": API_PORT, "UserIdGroupPairs": [{"GroupId": sgs['alb']}]}])
+        try: self.ec2.authorize_security_group_ingress(GroupId=sgs['api'], IpPermissions=[{"IpProtocol": "tcp", "FromPort": API_PORT, "ToPort": API_PORT, "UserIdGroupPairs": [{"GroupId": sgs['alb']}]}])
         except ClientError: pass
-        try: self.ec2.authorize_security_group_ingress(GroupId=sgs['ec2'], IpPermissions=[{"IpProtocol": "tcp", "FromPort": 22, "ToPort": 22, "IpRanges": [{"CidrIp": "0.0.0.0/0"}]}])
-        except ClientError: pass
+        
+        # O banco precisa aceitar conexões da API, do Worker e da sua máquina local (para criar o schema)
         try:
             self.ec2.authorize_security_group_ingress(GroupId=sgs['rds'], IpPermissions=[
-                {"IpProtocol": "tcp", "FromPort": DB_PORT, "ToPort": DB_PORT, "UserIdGroupPairs": [{"GroupId": sgs['ecs']}]},
-                {"IpProtocol": "tcp", "FromPort": DB_PORT, "ToPort": DB_PORT, "UserIdGroupPairs": [{"GroupId": sgs['ec2']}]},
+                {"IpProtocol": "tcp", "FromPort": DB_PORT, "ToPort": DB_PORT, "UserIdGroupPairs": [{"GroupId": sgs['api']}]},
+                {"IpProtocol": "tcp", "FromPort": DB_PORT, "ToPort": DB_PORT, "UserIdGroupPairs": [{"GroupId": sgs['worker']}]},
                 {"IpProtocol": "tcp", "FromPort": DB_PORT, "ToPort": DB_PORT, "IpRanges": [{"CidrIp": "0.0.0.0/0"}]}
             ])
         except ClientError: pass
@@ -221,19 +218,6 @@ class Arquitetura:
         conn.commit()
         conn.close()
         print("[RDS] Tabelas criadas com sucesso (Preparadas para o Simulador)!")
-    
-    def allocate_ec2(self):
-        ssm = boto3.client("ssm", region_name=REGION)
-        ami_id = ssm.get_parameter(Name="/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2")["Parameter"]["Value"]
-        print(f"[EC2] Creating 2 Worker Nodes ({EC2_INSTANCE_TYPE}) ...")
-        try:
-            # Requisito: 2 Máquinas para demonstrar tolerância a falha (encerrando uma ao vivo)
-            self.ec2.run_instances(
-                ImageId=ami_id, InstanceType=EC2_INSTANCE_TYPE, KeyName=KEY_PAIR_NAME, 
-                SecurityGroupIds=[self.sgs['ec2']], MinCount=2, MaxCount=2,
-                TagSpecifications=[{"ResourceType": "instance", "Tags": [{"Key": "Name", "Value": "DijkFood-Worker"}]}]
-            )
-        except ClientError as e: print(f"[EC2] Warning: {e}")
 
     def allocate_dynamodb(self):
         for tb_name, pk_name in [(DDB_TABLE_EVENTOS, "id_pedido"), (DDB_TABLE_TELEMETRIA, "id_entregador")]:
@@ -254,26 +238,27 @@ class Arquitetura:
             self.s3.create_bucket(Bucket=S3_BUCKET_NAME)
         except ClientError: pass
 
-    def allocate_ecs_and_alb(self):
-        print(f"\n--- Criando Camada de API REST (ECS + Load Balancer) ---")
+    def allocate_ecs_services(self):
+        print(f"\n--- Criando Cluster ECS e Serviços ---")
         subnets = [s['SubnetId'] for s in self.ec2.describe_subnets(Filters=[{'Name': 'vpc-id', 'Values': [self.vpc_id]}])['Subnets']]
 
         # 1. Cluster
         self.ecs.create_cluster(clusterName=ECS_CLUSTER_NAME)
         print(f"[ECS] Cluster '{ECS_CLUSTER_NAME}' verificado/criado.")
 
-        # 2. Load Balancer
+        # ==========================================
+        # CONFIGURAÇÃO DO SERVIÇO DA API (Com ALB)
+        # ==========================================
+        print(f"\n[ECS-API] Configurando Camada de API...")
         alb_arn = None
         try:
             alb = self.elbv2.create_load_balancer(Name=ALB_NAME, Subnets=subnets, SecurityGroups=[self.sgs['alb']], Scheme='internet-facing')
             alb_arn = alb['LoadBalancers'][0]['LoadBalancerArn']
-            print(f"[ALB] Load Balancer '{ALB_NAME}' criado.")
         except ClientError as e:
             if e.response['Error']['Code'] == 'DuplicateLoadBalancerName':
                 alb_arn = self.elbv2.describe_load_balancers(Names=[ALB_NAME])['LoadBalancers'][0]['LoadBalancerArn']
             else: raise
 
-        # 3. Target Group
         tg_arn = None
         try:
             tg = self.elbv2.create_target_group(Name=TG_NAME, Protocol='HTTP', Port=API_PORT, VpcId=self.vpc_id, TargetType='ip', HealthCheckPath='/')
@@ -283,24 +268,18 @@ class Arquitetura:
                 tg_arn = self.elbv2.describe_target_groups(Names=[TG_NAME])['TargetGroups'][0]['TargetGroupArn']
             else: raise
 
-        # 4. Listener
         listeners = self.elbv2.describe_listeners(LoadBalancerArn=alb_arn)['Listeners']
         if not any(l['Port'] == 80 for l in listeners):
             self.elbv2.create_listener(LoadBalancerArn=alb_arn, Protocol='HTTP', Port=80, DefaultActions=[{'Type': 'forward', 'TargetGroupArn': tg_arn}])
 
-        # 5. Task Definition (Com variáveis de ambiente injetadas!)
-        task_def_arn = None
+        api_task_arn = None
         try:
             response = self.ecs.register_task_definition(
-                family="dijkfood-api-task",
-                networkMode="awsvpc",
-                executionRoleArn=LAB_ROLE_ARN,
-                taskRoleArn=LAB_ROLE_ARN,
-                requiresCompatibilities=["FARGATE"],
-                cpu="256", memory="512",
+                family="dijkfood-api-task", networkMode="awsvpc", executionRoleArn=LAB_ROLE_ARN, taskRoleArn=LAB_ROLE_ARN,
+                requiresCompatibilities=["FARGATE"], cpu="256", memory="512",
                 containerDefinitions=[{
                     "name": "dijkfood-api-container",
-                    "image": "nginxdemos/hello", # Substitua por sua imagem Docker real
+                    "image": "nginxdemos/hello", # Substitua pela sua imagem Docker da API
                     "portMappings": [{"containerPort": API_PORT, "hostPort": API_PORT, "protocol": "tcp"}],
                     "environment": [
                         {"name": "DB_HOST", "value": self.rds_endpoint},
@@ -312,40 +291,118 @@ class Arquitetura:
                     ]
                 }]
             )
-            task_def_arn = response['taskDefinition']['taskDefinitionArn']
-            print(f"[ECS] Task Definition registrada com variáveis de ambiente do RDS e DynamoDB.")
-        except ClientError as e: print(f"[ECS] Aviso Task Def: {e}")
+            api_task_arn = response['taskDefinition']['taskDefinitionArn']
+        except ClientError as e: print(f"[ECS-API] Aviso Task Def: {e}")
 
-        # 6. Service Fargate
         try:
             self.ecs.create_service(
-                cluster=ECS_CLUSTER_NAME, serviceName="dijkfood-api-service", taskDefinition=task_def_arn,
+                cluster=ECS_CLUSTER_NAME, serviceName="dijkfood-api-service", taskDefinition=api_task_arn,
                 desiredCount=2, launchType="FARGATE",
-                networkConfiguration={'awsvpcConfiguration': {'subnets': subnets, 'securityGroups': [self.sgs['ecs']], 'assignPublicIp': 'ENABLED'}},
+                networkConfiguration={'awsvpcConfiguration': {'subnets': subnets, 'securityGroups': [self.sgs['api']], 'assignPublicIp': 'ENABLED'}},
                 loadBalancers=[{'targetGroupArn': tg_arn, 'containerName': 'dijkfood-api-container', 'containerPort': API_PORT}]
             )
-            print(f"[ECS] Serviço Fargate iniciado com 2 contêineres!")
+            print(f"[ECS-API] Serviço Fargate iniciado!")
         except ClientError as e:
-            if e.response['Error']['Code'] != 'InvalidParameterException': print(f"[ECS] Aviso Service: {e}")
+            if e.response['Error']['Code'] != 'InvalidParameterException': print(f"[ECS-API] Aviso Service: {e}")
 
-        # 7. AUTO-SCALING (Requisito Crítico do Simulador)
-        print(f"[ECS] Configurando Auto-Scaling (Target 70% CPU)...")
+        # Auto-Scaling da API
         resource_id = f"service/{ECS_CLUSTER_NAME}/dijkfood-api-service"
         try:
             self.app_asg.register_scalable_target(
-                ServiceNamespace='ecs', ResourceId=resource_id, ScalableDimension='ecs:service:DesiredCount', MinCapacity=2, MaxCapacity=10
+                ServiceNamespace='ecs', 
+                ResourceId=resource_id, 
+                ScalableDimension='ecs:service:DesiredCount', 
+                MinCapacity=2, 
+                MaxCapacity=10
             )
             self.app_asg.put_scaling_policy(
-                PolicyName='dijkfood-api-cpu-scaling', ServiceNamespace='ecs', ResourceId=resource_id, ScalableDimension='ecs:service:DesiredCount',
+                PolicyName='dijkfood-api-cpu-scaling',
+                ServiceNamespace='ecs', 
+                ResourceId=resource_id, 
+                ScalableDimension='ecs:service:DesiredCount',
                 PolicyType='TargetTrackingScaling',
                 TargetTrackingScalingPolicyConfiguration={
-                    'TargetValue': 70.0, 'PredefinedMetricSpecification': {'PredefinedMetricType': 'ECSServiceAverageCPUUtilization'},
-                    'ScaleOutCooldown': 60, 'ScaleInCooldown': 60
-                }
+                    'TargetValue': 70.0, 
+                    'PredefinedMetricSpecification': {
+                        'PredefinedMetricType': 'ECSServiceAverageCPUUtilization'
+                    }, 
+                    'ScaleOutCooldown': 60, 
+                    'ScaleInCooldown': 60}
             )
-        except ClientError as e: print(f"[ECS] Aviso Auto-scaling: {e}")
+        except ClientError as e: print(f"[ECS-API] Aviso Auto-scaling: {e}")
+
+
+        # ==========================================
+        # CONFIGURAÇÃO DO SERVIÇO DO WORKER (Sem ALB)
+        # ==========================================
+        print(f"\n[ECS-Worker] Configurando Camada de Cálculo de Rotas...")
+        worker_task_arn = None
+        try:
+            response = self.ecs.register_task_definition(
+                family="dijkfood-worker-task", networkMode="awsvpc", executionRoleArn=LAB_ROLE_ARN, taskRoleArn=LAB_ROLE_ARN,
+                requiresCompatibilities=["FARGATE"], 
+                cpu="512", memory="1024", # Mais RAM para armazenar o grafo viário de SP
+                containerDefinitions=[{
+                    "name": "dijkfood-worker-container",
+                    "image": "python:3.9-slim", # Substitua pela sua imagem Docker do Script de Worker
+                    "environment": [
+                        {"name": "DB_HOST", "value": self.rds_endpoint},
+                        {"name": "DB_USER", "value": DB_ADMIN_USER},
+                        {"name": "DB_PASS", "value": DB_PASSWORD},
+                        {"name": "DB_NAME", "value": DB_NAME},
+                        {"name": "S3_BUCKET", "value": S3_BUCKET_NAME} # Necessário para o script baixar o grafo
+                    ]
+                }]
+            )
+            worker_task_arn = response['taskDefinition']['taskDefinitionArn']
+        except ClientError as e: print(f"[ECS-Worker] Aviso Task Def: {e}")
+
+        try:
+            self.ecs.create_service(
+                cluster=ECS_CLUSTER_NAME, serviceName="dijkfood-worker-service", taskDefinition=worker_task_arn,
+                desiredCount=2, # Requisito: Alta Disponibilidade e Tolerância a Falhas
+                launchType="FARGATE",
+                networkConfiguration={'awsvpcConfiguration': {'subnets': subnets, 'securityGroups': [self.sgs['worker']], 'assignPublicIp': 'ENABLED'}}
+            )
+            print(f"[ECS-Worker] Serviço de processamento em background iniciado com 2 workers!")
+        except ClientError as e:
+            if e.response['Error']['Code'] != 'InvalidParameterException': print(f"[ECS-Worker] Aviso Service: {e}")
 
         print(f"\n[ALB] URL da sua API: http://{self.elbv2.describe_load_balancers(Names=[ALB_NAME])['LoadBalancers'][0]['DNSName']}")
+        # ==========================================
+        # AUTO-SCALING DO SERVIÇO DO WORKER
+        # ==========================================
+        print(f"\n[ECS-Worker] Configurando Auto-Scaling (Target 70% CPU)...")
+        worker_resource_id = f"service/{ECS_CLUSTER_NAME}/dijkfood-worker-service"
+        try:
+            # 1. Registar o Worker como um alvo escalável (Mínimo 2, Máximo 10 contentores)
+            self.app_asg.register_scalable_target(
+                ServiceNamespace='ecs', 
+                ResourceId=worker_resource_id, 
+                ScalableDimension='ecs:service:DesiredCount', 
+                MinCapacity=2, 
+                MaxCapacity=10
+            )
+            
+            # 2. Aplicar a política de escalamento baseada na CPU
+            self.app_asg.put_scaling_policy(
+                PolicyName='dijkfood-worker-cpu-scaling', 
+                ServiceNamespace='ecs', 
+                ResourceId=worker_resource_id, 
+                ScalableDimension='ecs:service:DesiredCount',
+                PolicyType='TargetTrackingScaling',
+                TargetTrackingScalingPolicyConfiguration={
+                    'TargetValue': 70.0, 
+                    'PredefinedMetricSpecification': {
+                        'PredefinedMetricType': 'ECSServiceAverageCPUUtilization'
+                    },
+                    'ScaleOutCooldown': 60,  # Tempo de espera antes de adicionar mais
+                    'ScaleInCooldown': 60    # Tempo de espera antes de remover
+                }
+            )
+            print(f"[ECS-Worker] Auto-Scaling ativado com sucesso!")
+        except ClientError as e: 
+            print(f"[ECS-Worker] Aviso Auto-scaling: {e}")
 
     # ─────────────────────────────────────────────────────────────────────────────
     # POPULATE (Apenas o S3, o Simulador assume o resto)
@@ -395,13 +452,17 @@ class Arquitetura:
     def destroy(self):
         print("\n── Teardown " + "─" * 55)
 
-        # 1. Destruir ECS e ALB (A ordem importa!)
-        print(f"[ECS] Deletando ECS Service e Load Balancer...")
-        try:
-            self.ecs.update_service(cluster=ECS_CLUSTER_NAME, service="dijkfood-api-service", desiredCount=0)
-            time.sleep(10) # Espera os containers desligarem
-            self.ecs.delete_service(cluster=ECS_CLUSTER_NAME, service="dijkfood-api-service")
-        except ClientError: pass
+        print(f"[ECS] Deletando ECS Services e Load Balancer...")
+        for svc in ["dijkfood-api-service", "dijkfood-worker-service"]:
+            try:
+                self.ecs.update_service(cluster=ECS_CLUSTER_NAME, service=svc, desiredCount=0)
+            except ClientError: pass
+        
+        time.sleep(10) # Espera os containers desligarem
+        
+        for svc in ["dijkfood-api-service", "dijkfood-worker-service"]:
+            try: self.ecs.delete_service(cluster=ECS_CLUSTER_NAME, service=svc)
+            except ClientError: pass
     
         try:
             tg_arn = self.elbv2.describe_target_groups(Names=[TG_NAME])['TargetGroups'][0]['TargetGroupArn']
@@ -414,14 +475,6 @@ class Arquitetura:
     
         try: self.ecs.delete_cluster(cluster=ECS_CLUSTER_NAME)
         except ClientError: pass
-    
-        # 2. EC2
-        print(f"[EC2] Terminating instances with name 'DijkFood-Worker' ...")
-        instances = self.ec2.describe_instances(Filters=[{"Name": "tag:Name", "Values": ["DijkFood-Worker"]}])
-        for res in instances.get("Reservations", []):
-            for inst in res.get("Instances", []):
-                if inst["State"]["Name"] != "terminated":
-                    self.ec2.terminate_instances(InstanceIds=[inst["InstanceId"]])
     
         # 3. S3
         print(f"[S3]  Emptying and deleting bucket '{S3_BUCKET_NAME}' ...")
@@ -449,8 +502,8 @@ class Arquitetura:
         try: self.rds.delete_db_parameter_group(DBParameterGroupName=PG_GROUP_NAME)
         except ClientError: pass
     
-        # Deletar SGs no final (Após RDS e EC2 estarem mortos)
-        for sg_name in ["dijkfood-ecs-sg", "dijkfood-alb-sg", "dijkfood-rds-sg", "dijkfood-worker-sg"]:
+        # Deletar SGs no final (Após serviços do ECS e RDS estarem mortos)
+        for sg_name in ["dijkfood-api-sg", "dijkfood-worker-sg", "dijkfood-alb-sg", "dijkfood-rds-sg"]:
             try:
                 sgs = self.ec2.describe_security_groups(Filters=[{"Name": "group-name", "Values": [sg_name]}])
                 if sgs["SecurityGroups"]: 
