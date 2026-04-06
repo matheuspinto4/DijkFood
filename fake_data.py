@@ -1,6 +1,7 @@
 from faker import Faker
 from faker.providers import BaseProvider
 import random
+import pandas as pd
 
 class RestauranteProvider(BaseProvider):
     tipos_culinaria = [
@@ -38,7 +39,8 @@ class RestauranteProvider(BaseProvider):
             return f"{estabelecimento} {sobrenome}"
 
 
-def get_lat_lon(): return random.uniform(-23.7, -23.4), random.uniform(-46.8, -46.3)
+def get_lat_lon(nodes): 
+    return random.choice(nodes.values)[1:]
 
 def gerar_dados_falsos(numero_de_clientes : int, numero_de_restaurantes : int, numero_de_entregadores : int):
     """
@@ -46,11 +48,30 @@ def gerar_dados_falsos(numero_de_clientes : int, numero_de_restaurantes : int, n
     """
     fake = Faker(['pt-BR'])
     fake.add_provider(RestauranteProvider)
+    nodes = pd.read_csv("nodes.csv")
 
-    
-    clientes = [(f"{fake.name()}", f"{fake.email()}", f"{fake.phone_number()}", *get_lat_lon()) for i in range(numero_de_clientes)]
-    restaurantes = [(f"{fake.nome_restaurante()}", f"{fake.tipo_restaurante()}", *get_lat_lon()) for i in range(numero_de_restaurantes)]
-    entregadores = [(f"{fake.name()}", f"{random.choice(["moto", "carro", "caminhao", "biscicleta", "pé", "cavalo", "triciclo", "chihuahua", "galinha"])}", *get_lat_lon(), False) for i in range(numero_de_entregadores)]
+    clientes = [
+        {
+            "nome": f"{fake.name()}", 
+            "email": f"{fake.email()}", 
+            "telefone": f"{fake.phone_number()}", 
+            **{k: v for k, v in zip(["latitude", "longitude"], get_lat_lon(nodes))}
+        } for _ in range(numero_de_clientes)
+    ]
+    restaurantes = [
+        {
+            "nome": f"{fake.nome_restaurante()}", 
+            "tipo_cozinha": f"{fake.tipo_restaurante()}", 
+            **{k: v for k, v in zip(["latitude", "longitude"], get_lat_lon(nodes))}
+        } for _ in range(numero_de_restaurantes)
+    ]
+    entregadores = [
+        {
+            "nome": f"{fake.name()}", 
+            "tipo_veiculo": f"{random.choice(['moto', 'carro', 'caminhao', 'biscicleta', 'pé', 'cavalo', 'triciclo', 'chihuahua', 'galinha'])}", 
+            **{k: v for k, v in zip(["latitude", "longitude"], get_lat_lon(nodes))}
+        } for _ in range(numero_de_entregadores)
+    ]
 
     return (clientes, restaurantes, entregadores)
 
@@ -62,4 +83,3 @@ if __name__ == "__main__":
         for l in a:
             print(l)
         print(40*"_")
-

@@ -10,10 +10,10 @@ Lifecycle:
   3. destroy    — Apaga rigorosamente TODOS os recursos
 
 Usage:
-  python deploy_dijkfood.py                           # Cria, popula o S3 e APAGA em seguida
-  python deploy_dijkfood.py --step allocate           # Cria a infraestrutura e o schema vazio
-  python deploy_dijkfood.py --step populate           # Envia o Grafo para o S3
-  python deploy_dijkfood.py --step destroy            # Apaga toda a infraestrutura
+  python deploy.py                           # Cria, popula o S3 e APAGA em seguida
+  python deploy.py --step allocate           # Cria a infraestrutura e o schema vazio
+  python deploy.py --step populate           # Envia o Grafo para o S3
+  python deploy.py --step destroy            # Apaga toda a infraestrutura
 """
 
 import argparse
@@ -24,6 +24,8 @@ import csv
 import os
 import osmnx as ox
 from botocore.exceptions import ClientError
+from simulator import main as simulator
+import asyncio
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 REGION         = "us-east-1"
@@ -367,6 +369,7 @@ class Arquitetura:
                 key = (u, v)
                 if key not in seen_edges or w < seen_edges[key]:
                     seen_edges[key] = w
+            print("Passei do for")
 
             with open(edges_file, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
@@ -473,6 +476,8 @@ def main():
 
     if args.step in ("all", "populate"):
         arquitetura.populate_graph_s3()
+
+    asyncio.run(simulator())
 
     if args.step in ("all", "destroy"):
         arquitetura.destroy()
