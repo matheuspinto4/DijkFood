@@ -23,47 +23,41 @@ VOLUMES = {
 RITMO_EXEC = [
     {
         "volume": "OPERACAO_NORMAL",
-        "duracao": 60
+        "duracao": 1#60
     },
     {
         "volume": "PICO",
-        "duracao": 20
+        "duracao": 1#20
     },
     {
         "volume": "EVENTO_ESPECIAL",
-        "duracao": 40
+        "duracao": 1#40
     },
     {
         "volume": "OPERACAO_NORMAL",
-        "duracao": 20
+        "duracao": 1#20
     },
     {
         "volume": "PICO",
-        "duracao": 40
+        "duracao": 1#40
     }
 ]
 
 
-async def worker(semaphore, client, url, json, results, id_register):
-    async with semaphore:
-        response = await client.post(
-            url,
-            json=json
-        )
-        results.append(response[id_register]) 
-        return response.status_code
-
 async def preload(jsons, url, id_register, ids):
-    semaphore = asyncio.Semaphore(CONCURRENCY)
-    results = []
-
-    async with httpx.AsyncClient() as client:
-        tasks = [
-            worker(semaphore, client, url, json, results, id_register)
-            for json in jsons
-        ]
-        await asyncio.gather(*tasks)
-    ids[id_register] = results
+    print(f"Enviando lote de {len(jsons)} registros para {url}bulk ...")
+    
+    # Timeout generoso de 60s apenas para garantir que o banco grave tudo
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        response = await client.post(url + "bulk", json=jsons)
+        
+        if response.status_code == 200:
+            print(f"Sucesso! {len(jsons)} inseridos.")
+            # Como limpamos o banco antes, sabemos que os IDs gerados serão de 1 até N
+            ids[id_register] = list(range(1, len(jsons) + 1))
+        else:
+            print(f"Erro fatal no Bulk Insert: {response.text}")
+            raise Exception("Falha ao popular o banco de dados!")
 
 
 async def requester(queue, results):
@@ -177,11 +171,13 @@ async def main():
         numero_de_restaurantes=N_RESTAURANTES, 
         numero_de_entregadores=N_ENTREGADORES
     )
+
+    # No main.py essas taks possuem uma barra no final, mudei aqui
     tasks = [
         preload(jsons, URL + path, id_register, ids)
         for jsons, path, id_register in zip(
             data,
-            ["/clientes", "/restaurantes", "/entregadores"],
+            ["/clientes/", "/restaurantes/", "/entregadores/"],
             ["id_cliente", "id_restaurante", "id_entregador"]
         )
     ]

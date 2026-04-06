@@ -24,6 +24,8 @@ import csv
 import os
 import osmnx as ox
 from botocore.exceptions import ClientError
+from simulator import main as simulator
+import asyncio
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 REGION         = "us-east-1"
@@ -473,6 +475,8 @@ def main():
 
     if args.step in ("all", "populate"):
         arquitetura.populate_graph_s3()
+
+    asyncio.run(simulator())
 
     if args.step in ("all", "destroy"):
         arquitetura.destroy()

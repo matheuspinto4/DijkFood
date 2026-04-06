@@ -68,8 +68,8 @@ class Entregador(SQLModel, table=True):
 class EntregadorCreate(BaseModel):
     nome: str
     tipo_veiculo: str
-    latitude_inicial: float
-    longitude_inicial: float
+    latitude: float
+    longitude: float
 
 class PosicaoUpdate(BaseModel):
     latitude: float
@@ -193,8 +193,8 @@ def criar_entregador(entregador_in: EntregadorCreate, session: SessionDep):
         novo_entregador = Entregador(
                 nome = entregador_in.nome,
                 tipo_veiculo = entregador_in.tipo_veiculo,
-                latitude_inicial = entregador_in.latitude_inicial,
-                longitude_inicial = entregador_in.longitude_inicial
+                latitude = entregador_in.latitude,
+                longitude = entregador_in.longitude
         )
         session.add(novo_entregador)
 
@@ -396,3 +396,25 @@ def historico_pedido(id_pedido: int):
     except Exception as e:
         logger.error(f"Erro ao buscar histórico do pedido {id_pedido}: {e}")
         raise HTTPException(status_code=500, detail="Erro ao conectar com o histórico de eventos.")
+
+# Rotas otimizadas para o simulador, as outras faziam o computador morrer
+@app.post("/clientes/bulk")
+def criar_clientes_bulk(clientes_in: list[ClienteCreate], session: SessionDep):
+    novos = [Cliente(nome=c.nome, email=c.email, telefone=c.telefone, latitude=c.latitude, longitude=c.longitude) for c in clientes_in]
+    session.add_all(novos)
+    session.commit()
+    return {"status": "ok", "inseridos": len(novos)}
+
+@app.post("/restaurantes/bulk")
+def criar_restaurantes_bulk(restaurantes_in: list[RestauranteCreate], session: SessionDep):
+    novos = [Restaurante(nome=r.nome, tipo_cozinha=r.tipo_cozinha, latitude=r.latitude, longitude=r.longitude) for r in restaurantes_in]
+    session.add_all(novos)
+    session.commit()
+    return {"status": "ok", "inseridos": len(novos)}
+
+@app.post("/entregadores/bulk")
+def criar_entregadores_bulk(entregadores_in: list[EntregadorCreate], session: SessionDep):
+    novos = [Entregador(nome=e.nome, tipo_veiculo=e.tipo_veiculo, latitude=e.latitude, longitude=e.longitude) for e in entregadores_in]
+    session.add_all(novos)
+    session.commit()
+    return {"status": "ok", "inseridos": len(novos)}

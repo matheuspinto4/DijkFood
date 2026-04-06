@@ -66,7 +66,7 @@ def gerar_dados_falsos(numero_de_clientes : int, numero_de_restaurantes : int, n
         {
             "nome": f"{fake.name()}", 
             "tipo_veiculo": f"{random.choice(['moto', 'carro', 'caminhao', 'biscicleta', 'pé', 'cavalo', 'triciclo', 'chihuahua', 'galinha'])}", 
-            **{k: v for k, v in zip(["latitude_inicial", "longitude_inicial"], get_lat_lon())}
+            **{k: v for k, v in zip(["latitude", "longitude"], get_lat_lon())}
         } for _ in range(numero_de_entregadores)
     ]
 
