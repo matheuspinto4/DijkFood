@@ -26,6 +26,9 @@ tabela_eventos = dynamodb.Table(NOME_TABELA_EVENTOS)
 NOME_TABELA_TELEMETRIA = os.getenv("DDB_TELEMETRIA", "dijkfood-telemetria-entregadores")
 tabela_telemetria = dynamodb.Table(NOME_TABELA_TELEMETRIA)
 
+NOME_TABELA_ALOCACOES = os.getenv("DDB_ALOCACOES", "dijkfood-alocacao-entregadores")
+tabela_alocacoes= dynamodb.Table(NOME_TABELA_ALOCACOES)
+
 # Configuração de logs para monitorar a API na nuvem (CloudWatch)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -326,7 +329,7 @@ def atualizar_status_pedido(id_pedido: int, update_data: PedidoStatusUpdate, ses
         raise HTTPException(status_code=404, detail="Pedido não encontrado")
 
     # Se não for a criação inicial (CONFIRMED), é exigido que já exista um entregador associado
-    if update_data.novo_status != StatusPedido.CONFIRMED and pedido.id_entregador is None:
+    if update_data.novo_status not in (StatusPedido.CONFIRMED, StatusPedido.READY_FOR_PICKUP, StatusPedido.PREPARING) and pedido.id_entregador is None:
         raise HTTPException(status_code=400, detail="O pedido ainda não possui entregador.")
 
     status_atual = pedido.status
@@ -382,6 +385,73 @@ def historico_pedido(id_pedido: int):
     except Exception as e:
         logger.error(f"Erro ao buscar histórico do pedido {id_pedido}: {e}")
         raise HTTPException(status_code=500, detail="Erro ao conectar com o histórico de eventos.")
+    
+
+@app.get("/entregadors/{id_entregador}/acompanhamento")
+def consultar_alocacao(id_entregador: int): 
+    # 1. Busca o status atualizado do entregador no DynamoDB
+    try:
+        resposta = tabela_alocacoes.query(
+            KeyConditionExpression=Key('id_entregador').eq(str(id_entregador)),
+            ScanIndexForward=False, 
+            Limit=1
+        )
+        itens = resposta.get('Items', [])
+    except Exception as e:
+        logger.error(f"Falha real de comunicação com DynamoDB: {e}")
+        raise HTTPException(status_code=500, detail="Erro ao conectar com o histórico de eventos.")
+
+    # A validação 404 agora está 100% protegida fora do try
+    if not itens:
+        raise HTTPException(status_code=404, detail="Nenhum status encontrado para este entregador.")
+
+    # ATENÇÃO: 'entregador_dict' é um Dicionário JSON, usamos .get() em vez de pontos
+    entregador_dict = itens[0]
+    status_atual = entregador_dict.get("status")
+    id_entregador_str = entregador_dict.get("id_entregador")
+
+    # 2. Busca a última posição do entregador no DynamoDB
+    ultima_posicao = None
+    if id_entregador_str and id_entregador_str != "None":
+        try:
+            resp_telemetria = tabela_telemetria.query(
+                KeyConditionExpression=Key('id_entregador').eq(id_entregador_str),
+                ScanIndexForward=False,
+                Limit=1 
+            )
+            itens_pos = resp_telemetria.get('Items', [])
+            if itens_pos:
+                ultima_posicao = {
+                    "latitude": float(itens_pos[0]["latitude"]),
+                    "longitude": float(itens_pos[0]["longitude"]),
+                    "ultima_atualizacao": itens_pos[0]["timestamp"]
+                }
+        except Exception as e:
+            logger.error(f"Erro ao buscar telemetria, mas ignorando para o usuário: {e}")
+            pass
+
+    # 3. Junta tudo e devolve para o cliente
+    return {
+        "id_entregador": id_entregador,
+        "status": status_atual,
+        "id_entregador": int(id_entregador_str) if id_entregador_str and id_entregador_str != "None" else None,
+        "posicao_entregador": ultima_posicao
+    }
+    
+@app.post("/alocacoes/{id_entregador}")
+def desativar_alocacao(id_entregador, id_pedido):
+    try:
+        tabela_alocacoes.put_item(
+            Item={
+                "id_entregador": str(id_entregador),
+                "timestamp": datetime.utcnow().isoformat(),
+                "status": "INATIVA",
+                "id_pedido": id_pedido,
+            }
+        )
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Erro ao desativar a alocacao")
 
 # Rotas Otimizadas para o Simulador (Bulk Insert)
 @app.post("/clientes/bulk")
