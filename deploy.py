@@ -203,7 +203,7 @@ class Arquitetura:
                     id_entregador SERIAL PRIMARY KEY,
                     nome VARCHAR(80),
                     tipo_veiculo VARCHAR(30),
-                    status VARCHAR(30),
+                    status VARCHAR(30) DEFAULT 'AVAILABLE',
                     latitude DOUBLE PRECISION,
                     longitude DOUBLE PRECISION
                 );
@@ -213,6 +213,7 @@ class Arquitetura:
                     id_restaurante INT REFERENCES restaurantes(id_restaurante),
                     id_entregador INT REFERENCES entregadores(id_entregador),
                     lista_itens TEXT,
+                    status VARCHAR(30) DEFAULT 'CONFIRMED',
                     data DATE,
                     horario TIME
                 );
@@ -278,10 +279,11 @@ class Arquitetura:
         try:
             response = self.ecs.register_task_definition(
                 family="dijkfood-api-task", networkMode="awsvpc", executionRoleArn=LAB_ROLE_ARN, taskRoleArn=LAB_ROLE_ARN,
-                requiresCompatibilities=["FARGATE"], cpu="256", memory="512",
+                requiresCompatibilities=["FARGATE"], 
+                cpu="256", memory="512",
                 containerDefinitions=[{
                     "name": "dijkfood-api-container",
-                    "image": "nginxdemos/hello", # Substitua pela sua imagem Docker da API
+                    "image": "wallita/dijkfood-api:latest", # Substitua pela sua imagem Docker da API
                     "portMappings": [{"containerPort": API_PORT, "hostPort": API_PORT, "protocol": "tcp"}],
                     "environment": [
                         {"name": "DB_HOST", "value": self.rds_endpoint},
@@ -329,7 +331,8 @@ class Arquitetura:
                         'PredefinedMetricType': 'ECSServiceAverageCPUUtilization'
                     }, 
                     'ScaleOutCooldown': 60, 
-                    'ScaleInCooldown': 60}
+                    'ScaleInCooldown': 60
+                }
             )
         except ClientError as e: print(f"[ECS-API] Aviso Auto-scaling: {e}")
 
@@ -343,10 +346,10 @@ class Arquitetura:
             response = self.ecs.register_task_definition(
                 family="dijkfood-worker-task", networkMode="awsvpc", executionRoleArn=LAB_ROLE_ARN, taskRoleArn=LAB_ROLE_ARN,
                 requiresCompatibilities=["FARGATE"], 
-                cpu="512", memory="1024", # Mais RAM para armazenar o grafo viário de SP
+                cpu="1024", memory="4096", # Mais RAM para armazenar o grafo viário de SP
                 containerDefinitions=[{
                     "name": "dijkfood-worker-container",
-                    "image": "python:3.9-slim", # Substitua pela sua imagem Docker do Script de Worker
+                    "image": "matheuspinto4/dijkfood-worker:latest", 
                     "environment": [
                         {"name": "DB_HOST", "value": self.rds_endpoint},
                         {"name": "DB_USER", "value": DB_ADMIN_USER},
@@ -371,6 +374,7 @@ class Arquitetura:
             if e.response['Error']['Code'] != 'InvalidParameterException': print(f"[ECS-Worker] Aviso Service: {e}")
 
         print(f"\n[ALB] URL da sua API: http://{self.elbv2.describe_load_balancers(Names=[ALB_NAME])['LoadBalancers'][0]['DNSName']}")
+       
         # ==========================================
         # AUTO-SCALING DO SERVIÇO DO WORKER
         # ==========================================
