@@ -13,7 +13,8 @@ N_RESTAURANTES = 50
 N_ENTREGADORES = 3 * N_CLIENTES
 N_DDB_ITEMS    = 50000
 
-URL = "http://localhost:8000"
+URL = "http://localhost:80"
+URL = "http://dijkfood-api-alb-980772795.us-east-1.elb.amazonaws.com"
 CONCURRENCY = 40
 VOLUMES = {
     "OPERACAO_NORMAL": 10,
@@ -23,24 +24,24 @@ VOLUMES = {
 RITMO_EXEC = [
     {
         "volume": "OPERACAO_NORMAL",
-        "duracao": 60
+        "duracao": 60#60
     },
-    {
-        "volume": "PICO",
-        "duracao": 20
-    },
-    {
-        "volume": "EVENTO_ESPECIAL",
-        "duracao": 40
-    },
-    {
-        "volume": "OPERACAO_NORMAL",
-        "duracao": 20
-    },
-    {
-        "volume": "PICO",
-        "duracao": 40
-    }
+    # {
+    #     "volume": "PICO",
+    #     "duracao": 20
+    # },
+    # {
+    #     "volume": "EVENTO_ESPECIAL",
+    #     "duracao": 40
+    # },
+    # {
+    #     "volume": "OPERACAO_NORMAL",
+    #     "duracao": 20
+    # },
+    # {
+    #     "volume": "PICO",
+    #     "duracao": 40
+    # }
 ]
 
 # ================================ MUDEI AQUI ============================
@@ -74,7 +75,7 @@ async def preload(jsons, url, id_register, ids):
             ids[id_register] = list(range(1, len(jsons) + 1))
         else:
             print(f"Erro fatal no Bulk Insert: {response.text}")
-            raise Exception("Falha ao popular o banco de dados!")
+            raise Exception(f"Falha ao popular o banco de dados!, {url + "bulk"}, {jsons}")
 
 
 async def requester(queue, results):
@@ -142,7 +143,7 @@ async def producer_order(queue, volume, duration, ritmo_idx, clientes, restauran
         
         await queue.put({
             "method": "POST",
-            "url": f"{URL}/pedidos",
+            "url": f"{URL}/pedidos/",
             "json": json, 
             "ritmo_idx": ritmo_idx
         })
