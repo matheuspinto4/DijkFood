@@ -1,12 +1,15 @@
-# Usamos a mesma imagem leve
 FROM python:3.12-slim
 
 WORKDIR /app
 
-# Instala as dependências necessárias para o Worker (S3 e PostgreSQL)
-RUN pip install --no-cache-dir boto3 psycopg2-binary
+# Copia a lista de bibliotecas primeiro
+COPY requirements.txt .
 
-COPY worker.py /app/worker.py
+# Instala as bibliotecas
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Inicia o script em loop
+# Copia o seu código
+COPY worker.py .
+
+# Roda o Worker no modo unbuffered (-u) para os prints aparecerem na AWS
 CMD ["python", "-u", "worker.py"]

@@ -16,7 +16,9 @@ DB_USER = os.getenv("DB_USER")
 DB_PASS = os.getenv("DB_PASS")
 DB_NAME = os.getenv("DB_NAME")
 S3_BUCKET = os.getenv("S3_BUCKET")
-API_URL = os.getenv("API_URL", "http://localhost:8000") # Endpoint da API REST (ALB)
+
+# A mágica acontece aqui: A AWS injeta a URL do Load Balancer nesta variável!
+API_URL = os.getenv("API_URL", "http://localhost:8000") 
 
 # ---------------------------------------------------------------------------
 # Funções Matemáticas e Algoritmos
@@ -135,7 +137,7 @@ def main():
                 cur.execute("SELECT latitude, longitude FROM restaurantes WHERE id_restaurante = %s;", (id_restaurante,))
                 res_lat, res_lon = cur.fetchone()
 
-                # C. Lê os Entregadores Disponíveis (sem trancar ainda, para podermos calcular o mais rápido)
+                # C. Lê os Entregadores Disponíveis
                 cur.execute("""
                     SELECT id_entregador, latitude, longitude 
                     FROM entregadores 
@@ -180,6 +182,7 @@ def main():
                 if melhor_entregador is None:
                     print(f"[WORKER] Caminho impossível pelas ruas para todos os candidatos.")
                     conn.rollback()
+                    time.sleep(2)
                     continue
 
                 # G. Tranca o entregador vencedor no banco (evita que outro Worker o roube)
@@ -190,7 +193,6 @@ def main():
                 """, (melhor_entregador,))
                 
                 if not cur.fetchone():
-                    # Entregador foi atribuído a outro pedido no último milissegundo!
                     print(f"[WORKER] Entregador {melhor_entregador} já ocupado. Reprocessando o pedido...")
                     conn.rollback()
                     continue
@@ -201,16 +203,20 @@ def main():
                 cur.execute("UPDATE entregadores SET status = 'BUSY' WHERE id_entregador = %s;", (melhor_entregador,))
                 cur.execute("UPDATE pedidos SET id_entregador = %s WHERE id_pedido = %s;", (melhor_entregador, id_pedido))
 
-                # I. CHAMA A API REST: Cumpre o requisito e aciona o histórico do DynamoDB
+                conn.commit()
+
+                # I. CHAMA A API REST: Aciona a mudança de status e o DynamoDB
                 patch_url = f"{API_URL}/pedidos/{id_pedido}/status"
                 response = requests.patch(patch_url, json={"novo_status": "PREPARING"}, timeout=5)
                 
                 if response.status_code == 200:
-                    conn.commit() # Confirma tudo atómicamente!
                     print(f"[WORKER] Sucesso! Pedido {id_pedido} avançou via API. Entregador {melhor_entregador} a caminho.")
                 else:
                     print(f"[WORKER] Erro na API REST ({response.status_code}): {response.text}")
-                    conn.rollback()
+                    # Reversão manual: Se a API falhou (caiu, timeout), soltamos o entregador e o pedido
+                    cur.execute("UPDATE entregadores SET status = 'AVAILABLE' WHERE id_entregador = %s;", (melhor_entregador,))
+                    cur.execute("UPDATE pedidos SET id_entregador = NULL WHERE id_pedido = %s;", (id_pedido,))
+                    conn.commit()
                     time.sleep(1)
 
         except Exception as e:

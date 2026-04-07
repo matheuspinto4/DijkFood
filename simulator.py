@@ -13,7 +13,8 @@ N_RESTAURANTES = 50
 N_ENTREGADORES = 3 * N_CLIENTES
 N_DDB_ITEMS    = 50000
 
-URL = "http://localhost:8000"
+URL = "http://localhost:80"
+URL = "http://dijkfood-api-alb-980772795.us-east-1.elb.amazonaws.com"
 CONCURRENCY = 40
 VOLUMES = {
     "OPERACAO_NORMAL": 10,
@@ -23,7 +24,7 @@ VOLUMES = {
 RITMO_EXEC = [
     {
         "volume": "OPERACAO_NORMAL",
-        "duracao": 10#60
+        "duracao": 10#60#60
     },
     # {
     #     "volume": "PICO",
@@ -74,7 +75,7 @@ async def preload(jsons, url, id_register, ids):
             ids[id_register] = list(range(1, len(jsons) + 1))
         else:
             print(f"Erro fatal no Bulk Insert: {response.text}")
-            raise Exception("Falha ao popular o banco de dados!")
+            raise Exception(f"Falha ao popular o banco de dados!, {url + "bulk"}, {jsons}")
 
 
 async def requester(queue, results):
