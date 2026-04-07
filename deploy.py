@@ -42,6 +42,7 @@ PG_GROUP_NAME  = "dijkfood-pg16"
 # Configurações DynamoDB
 DDB_TABLE_EVENTOS    = "dijkfood-historico-eventos"
 DDB_TABLE_TELEMETRIA = "dijkfood-telemetria-entregadores"
+DDB_TABLE_ALOCACAO_ENTREGADOR = "dijkfood-alocacao-entregador"
 
 # Configurações S3 & Grafo
 S3_BUCKET_NAME = f"dijkfood-grafo-sp-{ACCOUNT_ID}"
@@ -177,7 +178,7 @@ class Arquitetura:
         conn.close()
 
     def allocate_dynamodb(self):
-        for tb_name, pk_name in [(DDB_TABLE_EVENTOS, "id_pedido"), (DDB_TABLE_TELEMETRIA, "id_entregador")]:
+        for tb_name, pk_name in [(DDB_TABLE_EVENTOS, "id_pedido"), (DDB_TABLE_TELEMETRIA, "id_entregador"), (DDB_TABLE_ALOCACAO_ENTREGADOR, "id_entregador")]:
             try:
                 table = self.ddb.create_table(TableName=tb_name, KeySchema=[{"AttributeName": pk_name, "KeyType": "HASH"}, {"AttributeName": "timestamp", "KeyType": "RANGE"}], AttributeDefinitions=[{"AttributeName": pk_name, "AttributeType": "S"}, {"AttributeName": "timestamp", "AttributeType": "S"}], BillingMode="PAY_PER_REQUEST")
                 table.wait_until_exists()
