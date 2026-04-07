@@ -40,7 +40,8 @@ class RestauranteProvider(BaseProvider):
 
 
 def get_lat_lon(nodes): 
-    return random.choice(nodes.values)[1:]
+    coords = random.choice(nodes.values)[1:]
+    return (float(coords[0]), float(coords[1]))
 
 def gerar_dados_falsos(numero_de_clientes : int, numero_de_restaurantes : int, numero_de_entregadores : int):
     """
