@@ -23,24 +23,24 @@ VOLUMES = {
 RITMO_EXEC = [
     {
         "volume": "OPERACAO_NORMAL",
-        "duracao": 60
+        "duracao": 10#60
     },
-    {
-        "volume": "PICO",
-        "duracao": 20
-    },
-    {
-        "volume": "EVENTO_ESPECIAL",
-        "duracao": 40
-    },
-    {
-        "volume": "OPERACAO_NORMAL",
-        "duracao": 20
-    },
-    {
-        "volume": "PICO",
-        "duracao": 40
-    }
+    # {
+    #     "volume": "PICO",
+    #     "duracao": 20
+    # },
+    # {
+    #     "volume": "EVENTO_ESPECIAL",
+    #     "duracao": 40
+    # },
+    # {
+    #     "volume": "OPERACAO_NORMAL",
+    #     "duracao": 20
+    # },
+    # {
+    #     "volume": "PICO",
+    #     "duracao": 40
+    # }
 ]
 
 # ================================ MUDEI AQUI ============================
@@ -130,19 +130,19 @@ async def producer_order(queue, volume, duration, ritmo_idx, clientes, restauran
         delta = random.expovariate(volume)
         await asyncio.sleep(delta)
 
-        async with orders_lock:
-            order_id = orders_acum
-            orders.append(order_id)
-            orders_acum += 1
-
         # Escolhe aleatoriamente um cliente e um restaurante
         id_cli = random.choice(clientes)
         id_res = random.choice(restaurantes)
         json = {"id_cliente": id_cli, "id_restaurante": id_res, "lista_itens": []}
+
+        async with orders_lock:
+            order_id = orders_acum
+            orders.append({"id_pedido": order_id, "id_cliente": id_cli, "id_restaurante": id_res})
+            orders_acum += 1
         
         await queue.put({
             "method": "POST",
-            "url": f"{URL}/pedidos",
+            "url": f"{URL}/pedidos/",
             "json": json, 
             "ritmo_idx": ritmo_idx
         })
@@ -161,12 +161,13 @@ async def viewer_order(queue, volume, duration, ritmo_idx):
             await asyncio.sleep(0.01)
             continue
         
+        # Escolhe aleatoriamente um pedido
+        order = random.choice(current_orders)
+        order_id = order["id_pedido"]
+
         # Produz visualizacoes de pedidos seguindo uma distribuicao de poisson
         delta = random.expovariate(volume)
         await asyncio.sleep(delta)
-
-        # Escolhe aleatoriamente um pedido
-        order_id = random.choice(current_orders)
             
         await queue.put({
             "method": "GET",
@@ -175,8 +176,43 @@ async def viewer_order(queue, volume, duration, ritmo_idx):
             "ritmo_idx": ritmo_idx
         })
 
+# Necessario obter os entregadores de corridas atraves do view order, para cada um deles, atualizar a rota a cada 100ms
+# async def updater_courier(queue, volume, duration, ritmo_idx):
+#     start = time.perf_counter()
+
+#     while time.perf_counter() - start < duration:
+#         async with orders_lock:
+#             current_orders = list(orders)
+        
+#         if not current_orders:
+#             await asyncio.sleep(0.01)
+#             continue
+        
+#         # Escolhe aleatoriamente um pedido
+#         order = random.choice(current_orders)
+#         order_id = order["id_pedido"]
+        
+#         json = {"id_cliente": id_cli, "id_restaurante": id_res, "lista_itens": []}
+
+#         async with orders_lock:
+#             orders.append({"id_pedido": order_id, "id_cliente": id_cli, "id_restaurante": id_res})
+        
+#         # Produz pedidos seguindo uma distribuicao de poisson
+#         delta = random.expovariate(volume)
+#         await asyncio.sleep(delta)
+        
+#         await queue.put({
+#             "method": "POST",
+#             "url": f"{URL}/pedidos",
+#             "json": json, 
+#             "ritmo_idx": ritmo_idx
+#         })
+
+
 orders = []
 orders_lock = asyncio.Lock()
+entregadores = []
+entregadores_lock = asyncio.Lock()
 
 async def main():
     # Popular o sistema com dados basicos

@@ -104,7 +104,7 @@ class Pedido(SQLModel, table=True):
     id_pedido: int | None = Field(default=None, primary_key=True)
     id_cliente: int = Field(foreign_key="clientes.id_cliente")
     id_restaurante: int = Field(foreign_key="restaurantes.id_restaurante")
-    id_entregador: int = Field(foreign_key="entregadores.id_entregador")
+    id_entregador: int = Field(default=None, foreign_key="entregadores.id_entregador")
     lista_itens: str | None = None
     status: str = Field(default="CONFIRMED")
     data: date | None = None
@@ -273,7 +273,7 @@ def criar_pedido(pedido_in: PedidoCreate, session: SessionDep):
 
         tabela_eventos.put_item(
             Item={
-                "id_pedido": f"PEDIDO#{novo_pedido.id_pedido}",
+                "id_pedido": str(novo_pedido.id_pedido),
                 "timestamp": datetime.utcnow().isoformat(),
                 "status": novo_pedido.status,
                 "event_id": uuid.uuid4().hex[:8],
@@ -294,56 +294,53 @@ def criar_pedido(pedido_in: PedidoCreate, session: SessionDep):
         raise HTTPException(status_code=500, detail="Erro interno ao processar o pedido")
 
 @app.get("/pedidos/{id_pedido}/acompanhamento")
-def acompanhar_pedido(id_pedido: int, session: SessionDep):
-    # # 1. Busca o status atualizado no RDS
-    # pedido = session.get(Pedido, id_pedido)
-    # if not pedido:
-    #     raise HTTPException(status_code=404, detail="Pedido não encontrado")
-
+def acompanhar_pedido(id_pedido: int): # Removido o SessionDep! A rota agora é 100% NoSQL
     # 1. Busca o status atualizado do pedido no DynamoDB
     try:
         resposta = tabela_eventos.query(
-            KeyConditionExpression=Key('id_pedido').eq(f"PEDIDO#{id_pedido}"),
+            KeyConditionExpression=Key('id_pedido').eq(str(id_pedido)),
             ScanIndexForward=False, 
             Limit=1
         )
         itens = resposta.get('Items', [])
-        if not itens:
-            raise HTTPException(status_code=404, detail="Nenhum status encontrado para este pedido.")
-
-        pedido = itens[0]
-
     except Exception as e:
-        logger.error(f"Erro ao buscar o status do pedido {id_pedido}: {e}")
+        logger.error(f"Falha real de comunicação com DynamoDB: {e}")
         raise HTTPException(status_code=500, detail="Erro ao conectar com o histórico de eventos.")
+
+    # A validação 404 agora está 100% protegida fora do try
+    if not itens:
+        raise HTTPException(status_code=404, detail="Nenhum status encontrado para este pedido.")
+
+    # ATENÇÃO: 'pedido_dict' é um Dicionário JSON, usamos .get() em vez de pontos
+    pedido_dict = itens[0]
+    status_atual = pedido_dict.get("status")
+    id_entregador_str = pedido_dict.get("id_entregador")
 
     # 2. Busca a última posição do entregador no DynamoDB
     ultima_posicao = None
-    if pedido.id_entregador != None:
+    if id_entregador_str and id_entregador_str != "None":
         try:
-            resposta = tabela_telemetria.query(
-                KeyConditionExpression=Key('id_entregador').eq(str(pedido.id_entregador)),
-                ScanIndexForward=False, # Truque: Traz os dados de trás pra frente (o mais recente primeiro)
-                Limit=1 # Pega apenas a 1ª linha
+            resp_telemetria = tabela_telemetria.query(
+                KeyConditionExpression=Key('id_entregador').eq(id_entregador_str),
+                ScanIndexForward=False,
+                Limit=1 
             )
-            itens = resposta.get('Items', [])
-            if itens:
+            itens_pos = resp_telemetria.get('Items', [])
+            if itens_pos:
                 ultima_posicao = {
-                    "latitude": float(itens[0]["latitude"]),
-                    "longitude": float(itens[0]["longitude"]),
-                    "ultima_atualizacao": itens[0]["timestamp"]
+                    "latitude": float(itens_pos[0]["latitude"]),
+                    "longitude": float(itens_pos[0]["longitude"]),
+                    "ultima_atualizacao": itens_pos[0]["timestamp"]
                 }
         except Exception as e:
-            logger.error(f"Erro ao buscar telemetria do entregador {pedido.id_entregador}: {e}")
-            # Não quebramos a requisição se o GPS falhar, apenas retornamos sem a posição
-    else:
-        logger.info("Ainda não foi encontrado um entregador")
+            logger.error(f"Erro ao buscar telemetria, mas ignorando para o usuário: {e}")
+            pass
 
     # 3. Junta tudo e devolve para o cliente
     return {
-        "id_pedido": pedido.id_pedido,
-        "status": pedido.status,
-        "id_entregador": pedido.id_entregador,
+        "id_pedido": id_pedido,
+        "status": status_atual,
+        "id_entregador": int(id_entregador_str) if id_entregador_str and id_entregador_str != "None" else None,
         "posicao_entregador": ultima_posicao
     }
 
@@ -381,10 +378,9 @@ def atualizar_status_pedido(id_pedido: int, update_data: PedidoStatusUpdate, ses
         session.refresh(pedido)
 
         # 4. Grava o evento histórico no AWS DynamoDB
-        # Usamos o formato "PEDIDO#123" para bater com a chave de partição (Partition Key) do seu script
         tabela_eventos.put_item(
             Item={
-                "id_pedido": f"PEDIDO#{id_pedido}",
+                "id_pedido": str(id_pedido),
                 "timestamp": datetime.utcnow().isoformat(),
                 "status": novo_status,
                 "event_id": uuid.uuid4().hex[:8],
@@ -406,7 +402,7 @@ def historico_pedido(id_pedido: int):
     try:
         resposta = tabela_eventos.query(
             # Busca todos os eventos que pertencem a este pedido
-            KeyConditionExpression=Key('id_pedido').eq(f"PEDIDO#{id_pedido}"),
+            KeyConditionExpression=Key('id_pedido').eq(str(id_pedido)),
             # ScanIndexForward=True garante a ordem do mais antigo para o mais novo
             ScanIndexForward=True 
         )
