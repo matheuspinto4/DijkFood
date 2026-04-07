@@ -130,7 +130,7 @@ class Pedido(SQLModel, table=True):
     id_restaurante: int = Field(foreign_key="restaurantes.id_restaurante")
     
     # CORREÇÃO CRÍTICA: O pedido agora aceita nascer sem entregador!
-    id_entregador: int | None = Field(default=None, default=None, foreign_key="entregadores.id_entregador")
+    id_entregador: int | None = Field(default=None, foreign_key="entregadores.id_entregador")
     
     lista_itens: str | None = None
     status: str = Field(default="CONFIRMED")
@@ -269,7 +269,7 @@ def criar_pedido(pedido_in: PedidoCreate, session: SessionDep):
         raise HTTPException(status_code=500, detail="Erro ao processar o pedido")
 
 @app.get("/pedidos/{id_pedido}/acompanhamento")
-def acompanhar_pedido(id_pedido: int): # Removido o SessionDep! A rota agora é 100% NoSQL
+def acompanhar_pedido(id_pedido: int): 
     # 1. Busca o status atualizado do pedido no DynamoDB
     try:
         resposta = tabela_eventos.query(
@@ -294,11 +294,10 @@ def acompanhar_pedido(id_pedido: int): # Removido o SessionDep! A rota agora é 
     # 2. Busca a última posição do entregador no DynamoDB
     ultima_posicao = None
     if id_entregador_str and id_entregador_str != "None":
-    if pedido.id_entregador is not None:
         try:
-            resposta = tabela_telemetria.query(
-                KeyConditionExpression=Key('id_entregador').eq(str(pedido.id_entregador)),
-                ScanIndexForward=False, 
+            resp_telemetria = tabela_telemetria.query(
+                KeyConditionExpression=Key('id_entregador').eq(id_entregador_str),
+                ScanIndexForward=False,
                 Limit=1 
             )
             itens_pos = resp_telemetria.get('Items', [])
@@ -309,8 +308,10 @@ def acompanhar_pedido(id_pedido: int): # Removido o SessionDep! A rota agora é 
                     "ultima_atualizacao": itens_pos[0]["timestamp"]
                 }
         except Exception as e:
-            logger.error(f"Erro ao buscar telemetria: {e}")
+            logger.error(f"Erro ao buscar telemetria, mas ignorando para o usuário: {e}")
+            pass
 
+    # 3. Junta tudo e devolve para o cliente
     return {
         "id_pedido": id_pedido,
         "status": status_atual,
@@ -344,6 +345,8 @@ def atualizar_status_pedido(id_pedido: int, update_data: PedidoStatusUpdate, ses
         session.commit()
         session.refresh(pedido)
 
+        # 4. Grava o evento histórico no AWS DynamoDB
+        # Usamos o formato "PEDIDO#123" para bater com a chave de partição (Partition Key) do seu script
         tabela_eventos.put_item(
             Item={
                 "id_pedido": str(id_pedido),
@@ -362,6 +365,7 @@ def atualizar_status_pedido(id_pedido: int, update_data: PedidoStatusUpdate, ses
 
 @app.get("/pedidos/{id_pedido}/historico")
 def historico_pedido(id_pedido: int):
+    # Administrador consultando histórico cronológico
     try:
         resposta = tabela_eventos.query(
             # Busca todos os eventos que pertencem a este pedido
@@ -370,16 +374,16 @@ def historico_pedido(id_pedido: int):
             ScanIndexForward=True 
         )
         itens = resposta.get('Items', [])
+        
         if not itens:
-            raise HTTPException(status_code=404, detail="Nenhum histórico encontrado.")
+            raise HTTPException(status_code=404, detail="Nenhum histórico encontrado para este pedido.")
+            
         return itens
     except Exception as e:
-        logger.error(f"Erro ao buscar histórico: {e}")
-        raise HTTPException(status_code=500, detail="Erro ao buscar eventos.")
+        logger.error(f"Erro ao buscar histórico do pedido {id_pedido}: {e}")
+        raise HTTPException(status_code=500, detail="Erro ao conectar com o histórico de eventos.")
 
-# ---------------------------------------------------------------------------
 # Rotas Otimizadas para o Simulador (Bulk Insert)
-# ---------------------------------------------------------------------------
 @app.post("/clientes/bulk")
 def criar_clientes_bulk(clientes_in: list[ClienteCreate], session: SessionDep):
     novos = [Cliente(nome=c.nome, email=c.email, telefone=c.telefone, latitude=c.latitude, longitude=c.longitude) for c in clientes_in]

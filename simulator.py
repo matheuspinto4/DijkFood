@@ -94,6 +94,7 @@ async def requester(queue, results):
                         item["url"],
                         # params=item.get("params")
                     )
+                    print(response)
                 elif method == "POST":
                     response = await client.post(
                         item["url"],
