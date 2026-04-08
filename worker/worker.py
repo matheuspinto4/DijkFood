@@ -4,27 +4,33 @@ import boto3
 import psycopg2
 import csv
 import heapq
-import requests
 import math
 from collections import defaultdict
+from botocore.config import Config
+from datetime import datetime
+from decimal import Decimal
 
 # ---------------------------------------------------------------------------
 # Configurações de Ambiente
 # ---------------------------------------------------------------------------
+DYNAMODB_REGION = os.getenv("AWS_REGION", "us-east-1")
+boto_config = Config(max_pool_connections=50) # Libera 50 conexões simultâneas
+dynamodb = boto3.resource("dynamodb", region_name=DYNAMODB_REGION, config=boto_config)
+NOME_TABELA_ALOCACOES = os.getenv("DDB_ALOCACOES", "dijkfood-alocacao-entregadores")
+tabela_alocacoes = dynamodb.Table(NOME_TABELA_ALOCACOES)
+
 DB_HOST = os.getenv("DB_HOST")
 DB_USER = os.getenv("DB_USER")
 DB_PASS = os.getenv("DB_PASS")
 DB_NAME = os.getenv("DB_NAME")
 S3_BUCKET = os.getenv("S3_BUCKET")
 
-# A mágica acontece aqui: A AWS injeta a URL do Load Balancer nesta variável!
 API_URL = os.getenv("API_URL", "http://localhost:8000") 
 
 # ---------------------------------------------------------------------------
 # Funções Matemáticas e Algoritmos
 # ---------------------------------------------------------------------------
 def haversine(lat1, lon1, lat2, lon2):
-    """Calcula a distância em linha reta entre dois pontos (em km)"""
     R = 6371.0
     dlat = math.radians(lat2 - lat1)
     dlon = math.radians(lon2 - lon1)
@@ -32,7 +38,6 @@ def haversine(lat1, lon1, lat2, lon2):
     return R * (2 * math.atan2(math.sqrt(a), math.sqrt(1 - a)))
 
 def encontrar_no_mais_proximo(lat, lon, dict_nodes):
-    """Traduz uma coordenada de GPS para o ID do nó da rua mais próximo"""
     no_mais_proximo = None
     menor_distancia = float('inf')
     for node_id, coords in dict_nodes.items():
@@ -42,10 +47,10 @@ def encontrar_no_mais_proximo(lat, lon, dict_nodes):
             no_mais_proximo = node_id
     return no_mais_proximo
 
-def dijkstra(graph: dict[int, list[tuple[int, float]]], source: int) -> dict[int, float]:
-    """Calcula os caminhos mais curtos a partir do nó fonte (source)"""
-    dist: dict[int, float] = {source: 0.0}
-    heap: list[tuple[float, int]] = [(0.0, source)]
+def dijkstra(graph: dict[int, list[tuple[int, float]]], source: int):
+    dist = {source: 0.0}
+    prev = {source: None}
+    heap = [(0.0, source)]
 
     while heap:
         d_u, u = heapq.heappop(heap)
@@ -55,8 +60,40 @@ def dijkstra(graph: dict[int, list[tuple[int, float]]], source: int) -> dict[int
             alt = d_u + w
             if alt < dist.get(v, float("inf")):
                 dist[v] = alt
+                prev[v] = u
                 heapq.heappush(heap, (alt, v))
-    return dist
+    return dist, prev
+
+def extrair_caminho(prev: dict[int, int], source: int, target: int) -> list[int]:
+    """Reconstrói a lista de IDs de nós do destino até a origem."""
+    caminho = []
+    atual = target
+    if atual not in prev and atual != source:
+        return [] # Rota impossível
+    while atual is not None:
+        caminho.insert(0, atual)
+        atual = prev.get(atual)
+    return caminho
+
+def formatar_rota_dynamo(caminho: list[int], graph: dict, dict_nodes: dict) -> list:
+    """Transforma a lista de nós no formato de tuplas exigido, convertendo float para Decimal (exigência do DynamoDB)"""
+    rota_formatada = []
+    for i in range(len(caminho) - 1):
+        u = caminho[i]
+        v = caminho[i+1]
+        
+        # O Boto3/DynamoDB exige que valores de ponto flutuante sejam enviados como Decimal
+        coord_u = (Decimal(str(dict_nodes[u]['lat'])), Decimal(str(dict_nodes[u]['lon'])))
+        coord_v = (Decimal(str(dict_nodes[v]['lat'])), Decimal(str(dict_nodes[v]['lon'])))
+        
+        peso_aresta = 0.0
+        for vizinho, peso in graph.get(u, []):
+            if vizinho == v:
+                peso_aresta = peso
+                break
+                
+        rota_formatada.append([coord_u, coord_v, Decimal(str(peso_aresta))])
+    return rota_formatada
 
 # ---------------------------------------------------------------------------
 # Funções de Nuvem e Carregamento
@@ -91,7 +128,6 @@ def download_graph_from_s3():
 def main():
     print("[WORKER] Iniciando o serviço de cálculo de rotas...")
     
-    # 1. Traz o mapa para a RAM
     if S3_BUCKET:
         download_graph_from_s3()
         edges_path, nodes_path = "/tmp/graph_edges.csv", "/tmp/graph_nodes.csv"
@@ -102,7 +138,6 @@ def main():
     dict_nodes = load_nodes(nodes_path)
     print(f"[WORKER] Grafo carregado com {len(dict_nodes)} nós na memória.")
 
-    # 2. Conecta ao PostgreSQL
     conn = None
     while not conn:
         try:
@@ -113,31 +148,36 @@ def main():
             print("[WORKER] Aguardando banco de dados...")
             time.sleep(5)
 
-    # 3. Loop infinito (Consumidor de fila)
     while True:
         try:
             with conn.cursor() as cur:
-                # A. Tranca 1 Pedido que esteja aguardando roteamento
                 cur.execute("""
                     SELECT id_pedido, id_restaurante FROM pedidos 
-                    WHERE status = 'CONFIRMED' 
+                    WHERE status in ('PREPARING','READY_FOR_PICKUP') AND id_entregador IS NULL
                     FOR UPDATE SKIP LOCKED LIMIT 1;
                 """)
                 row_pedido = cur.fetchone()
 
                 if not row_pedido:
                     conn.rollback()
-                    time.sleep(1) # Dorme 1 segundo se a fila estiver vazia
+                    time.sleep(1)
                     continue
 
                 id_pedido, id_restaurante = row_pedido
                 print(f"\n[WORKER] Processando Pedido ID: {id_pedido} ...")
 
-                # B. Lê onde fica o Restaurante
                 cur.execute("SELECT latitude, longitude FROM restaurantes WHERE id_restaurante = %s;", (id_restaurante,))
                 res_lat, res_lon = cur.fetchone()
 
-                # C. Lê os Entregadores Disponíveis
+                # AJUSTE 2: Precisamos da localização do Cliente para calcular a segunda perna da viagem
+                cur.execute("""
+                    SELECT c.latitude, c.longitude 
+                    FROM clientes c
+                    JOIN pedidos p ON p.id_cliente = c.id_cliente
+                    WHERE p.id_pedido = %s;
+                """, (id_pedido,))
+                cli_lat, cli_lon = cur.fetchone()
+
                 cur.execute("""
                     SELECT id_entregador, latitude, longitude 
                     FROM entregadores 
@@ -151,7 +191,6 @@ def main():
                     time.sleep(2)
                     continue
 
-                # D. HEURÍSTICA: Corta caminho filtrando os 3 mais próximos em linha reta
                 candidatos = []
                 for id_ent, lat_ent, lon_ent in entregadores_disponiveis:
                     dist_reta = haversine(res_lat, res_lon, lat_ent, lon_ent)
@@ -160,32 +199,41 @@ def main():
                 candidatos.sort(key=lambda x: x[0])
                 top_3_candidatos = candidatos[:3]
 
-                # E. Encontra o ID do cruzamento (nó) do restaurante no mapa
                 no_restaurante = encontrar_no_mais_proximo(res_lat, res_lon, dict_nodes)
+                no_cliente = encontrar_no_mais_proximo(cli_lat, cli_lon, dict_nodes)
                 
                 melhor_entregador = None
                 menor_distancia_rua = float('inf')
+                caminho_ate_restaurante = []
 
-                # F. Roda o Dijkstra APENAS nos top 3 candidatos
+                # F. Roda o Dijkstra nos top 3 candidatos e guarda o melhor caminho
                 start_time = time.perf_counter()
                 for _, id_ent, lat_ent, lon_ent in top_3_candidatos:
                     no_entregador = encontrar_no_mais_proximo(lat_ent, lon_ent, dict_nodes)
-                    distancias = dijkstra(graph, no_entregador)
+                    distancias, prev = dijkstra(graph, no_entregador)
                     dist_real = distancias.get(no_restaurante, float('inf'))
                     
                     if dist_real < menor_distancia_rua:
                         menor_distancia_rua = dist_real
                         melhor_entregador = id_ent
+                        caminho_ate_restaurante = extrair_caminho(prev, no_entregador, no_restaurante)
 
                 elapsed = time.perf_counter() - start_time
 
-                if melhor_entregador is None:
+                if melhor_entregador is None or not caminho_ate_restaurante:
                     print(f"[WORKER] Caminho impossível pelas ruas para todos os candidatos.")
                     conn.rollback()
                     time.sleep(2)
                     continue
 
-                # G. Tranca o entregador vencedor no banco (evita que outro Worker o roube)
+                # AJUSTE 3: Calcula a segunda perna da viagem (Restaurante -> Cliente)
+                distancias_cli, prev_cli = dijkstra(graph, no_restaurante)
+                caminho_ate_cliente = extrair_caminho(prev_cli, no_restaurante, no_cliente)
+
+                # NOVO AJUSTE: Formata as duas pernas da viagem separadamente para o DynamoDB
+                rota_restaurante = formatar_rota_dynamo(caminho_ate_restaurante, graph, dict_nodes)
+                rota_cliente = formatar_rota_dynamo(caminho_ate_cliente, graph, dict_nodes)
+
                 cur.execute("""
                     SELECT id_entregador FROM entregadores 
                     WHERE id_entregador = %s AND status = 'AVAILABLE' 
@@ -199,25 +247,25 @@ def main():
 
                 print(f"[WORKER] Entregador {melhor_entregador} escolhido! Cálculo: {elapsed:.4f}s")
 
-                # H. Atualiza as relações no PostgreSQL
-                cur.execute("UPDATE entregadores SET status = 'BUSY' WHERE id_entregador = %s;", (melhor_entregador,))
-                cur.execute("UPDATE pedidos SET id_entregador = %s WHERE id_pedido = %s;", (melhor_entregador, id_pedido))
-
-                conn.commit()
-
-                # I. CHAMA A API REST: Aciona a mudança de status e o DynamoDB
-                patch_url = f"{API_URL}/pedidos/{id_pedido}/status"
-                response = requests.patch(patch_url, json={"novo_status": "PREPARING"}, timeout=5)
-                
-                if response.status_code == 200:
-                    print(f"[WORKER] Sucesso! Pedido {id_pedido} avançou via API. Entregador {melhor_entregador} a caminho.")
-                else:
-                    print(f"[WORKER] Erro na API REST ({response.status_code}): {response.text}")
-                    # Reversão manual: Se a API falhou (caiu, timeout), soltamos o entregador e o pedido
-                    cur.execute("UPDATE entregadores SET status = 'AVAILABLE' WHERE id_entregador = %s;", (melhor_entregador,))
-                    cur.execute("UPDATE pedidos SET id_entregador = NULL WHERE id_pedido = %s;", (id_pedido,))
+                try:
+                    tabela_alocacoes.put_item(
+                        Item={
+                            "id_entregador": str(melhor_entregador),
+                            "timestamp": datetime.utcnow().isoformat(),
+                            "status": "ATIVA",
+                            "id_pedido": id_pedido,
+                            "rota_restaurante": rota_restaurante,
+                            "rota_cliente": rota_cliente
+                        }
+                    )
+                    
+                    cur.execute("UPDATE entregadores SET status = 'BUSY' WHERE id_entregador = %s;", (melhor_entregador,))
+                    cur.execute("UPDATE pedidos SET id_entregador = %s WHERE id_pedido = %s;", (melhor_entregador, id_pedido))
                     conn.commit()
-                    time.sleep(1)
+                    
+                except Exception as e:
+                    print(f"[WORKER] Erro gravando no DynamoDB: {e}")
+                    conn.rollback()
 
         except Exception as e:
             conn.rollback()
