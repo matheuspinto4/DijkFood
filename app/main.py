@@ -387,7 +387,7 @@ def historico_pedido(id_pedido: int):
         raise HTTPException(status_code=500, detail="Erro ao conectar com o histórico de eventos.")
     
 
-@app.get("/alocacao/{id_entregador}/acompanhamento")
+@app.get("/alocacoes/{id_entregador}/acompanhamento")
 def consultar_alocacao(id_entregador: int): 
     # 1. Busca em qual pedido o entregador esta alocado no DynamoDB
     try:
@@ -401,20 +401,26 @@ def consultar_alocacao(id_entregador: int):
         logger.error(f"Falha real de comunicação com DynamoDB: {e}")
         raise HTTPException(status_code=500, detail="Erro ao conectar com o histórico de alocacoes.")
 
-    # ATENÇÃO: 'entregador_dict' é um Dicionário JSON, usamos .get() em vez de pontos
-    entregador_dict = itens[0]
     id_pedido_str = None
-    if itens and entregador_dict.get("status") == "ATIVO":
-        id_pedido_str = entregador_dict.get("id_pedido")
+    rota_restaurante = None
+    rota_cliente = None
+    if itens:
+        entregador_dict = itens[0]
+        if entregador_dict.get("status") == "ATIVO":
+            id_pedido_str = entregador_dict.get("id_pedido")
+            rota_restaurante = entregador_dict.get("rota_restaurante")
+            rota_cliente = entregador_dict.get("rota_cliente")
 
     # Falta adicionar a rota --------------
     # 2. Junta tudo e devolve para o entregador
     return {
         "id_entregador": id_entregador,
-        "id_pedido": id_pedido_str
+        "id_pedido": id_pedido_str,
+        "rota_restaurante": rota_restaurante,
+        "rota_cliente": rota_cliente
     }
     
-@app.post("/alocacoes/{id_entregador}-{id_pedido}")
+@app.post("/alocacoes/{id_entregador}/desativar/{id_pedido}")
 def desativar_alocacao(id_entregador, id_pedido):
     try:
         tabela_alocacoes.put_item(
@@ -423,6 +429,8 @@ def desativar_alocacao(id_entregador, id_pedido):
                 "timestamp": datetime.utcnow().isoformat(),
                 "status": "INATIVA",
                 "id_pedido": id_pedido,
+                "rota_restaurante": None,
+                "rota_cliente": None
             }
         )
 
