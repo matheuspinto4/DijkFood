@@ -387,9 +387,9 @@ def historico_pedido(id_pedido: int):
         raise HTTPException(status_code=500, detail="Erro ao conectar com o histórico de eventos.")
     
 
-@app.get("/entregadors/{id_entregador}/acompanhamento")
+@app.get("/alocacao/{id_entregador}/acompanhamento")
 def consultar_alocacao(id_entregador: int): 
-    # 1. Busca o status atualizado do entregador no DynamoDB
+    # 1. Busca em qual pedido o entregador esta alocado no DynamoDB
     try:
         resposta = tabela_alocacoes.query(
             KeyConditionExpression=Key('id_entregador').eq(str(id_entregador)),
@@ -399,46 +399,22 @@ def consultar_alocacao(id_entregador: int):
         itens = resposta.get('Items', [])
     except Exception as e:
         logger.error(f"Falha real de comunicação com DynamoDB: {e}")
-        raise HTTPException(status_code=500, detail="Erro ao conectar com o histórico de eventos.")
-
-    # A validação 404 agora está 100% protegida fora do try
-    if not itens:
-        raise HTTPException(status_code=404, detail="Nenhum status encontrado para este entregador.")
+        raise HTTPException(status_code=500, detail="Erro ao conectar com o histórico de alocacoes.")
 
     # ATENÇÃO: 'entregador_dict' é um Dicionário JSON, usamos .get() em vez de pontos
     entregador_dict = itens[0]
-    status_atual = entregador_dict.get("status")
-    id_entregador_str = entregador_dict.get("id_entregador")
+    id_pedido_str = None
+    if itens and entregador_dict.get("status") == "ATIVO":
+        id_pedido_str = entregador_dict.get("id_pedido")
 
-    # 2. Busca a última posição do entregador no DynamoDB
-    ultima_posicao = None
-    if id_entregador_str and id_entregador_str != "None":
-        try:
-            resp_telemetria = tabela_telemetria.query(
-                KeyConditionExpression=Key('id_entregador').eq(id_entregador_str),
-                ScanIndexForward=False,
-                Limit=1 
-            )
-            itens_pos = resp_telemetria.get('Items', [])
-            if itens_pos:
-                ultima_posicao = {
-                    "latitude": float(itens_pos[0]["latitude"]),
-                    "longitude": float(itens_pos[0]["longitude"]),
-                    "ultima_atualizacao": itens_pos[0]["timestamp"]
-                }
-        except Exception as e:
-            logger.error(f"Erro ao buscar telemetria, mas ignorando para o usuário: {e}")
-            pass
-
-    # 3. Junta tudo e devolve para o cliente
+    # Falta adicionar a rota --------------
+    # 2. Junta tudo e devolve para o entregador
     return {
         "id_entregador": id_entregador,
-        "status": status_atual,
-        "id_entregador": int(id_entregador_str) if id_entregador_str and id_entregador_str != "None" else None,
-        "posicao_entregador": ultima_posicao
+        "id_pedido": id_pedido_str
     }
     
-@app.post("/alocacoes/{id_entregador}")
+@app.post("/alocacoes/{id_entregador}-{id_pedido}")
 def desativar_alocacao(id_entregador, id_pedido):
     try:
         tabela_alocacoes.put_item(
