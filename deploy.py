@@ -42,7 +42,7 @@ PG_GROUP_NAME  = "dijkfood-pg16"
 # Configurações DynamoDB
 DDB_TABLE_EVENTOS    = "dijkfood-historico-eventos"
 DDB_TABLE_TELEMETRIA = "dijkfood-telemetria-entregadores"
-DDB_TABLE_ALOCACAO_ENTREGADOR = "dijkfood-alocacao-entregador"
+DDB_TABLE_ALOCACOES = "dijkfood-alocacao-entregadores"
 
 # Configurações S3 & Grafo
 S3_BUCKET_NAME = f"dijkfood-grafo-sp-{ACCOUNT_ID}"
@@ -178,7 +178,7 @@ class Arquitetura:
         conn.close()
 
     def allocate_dynamodb(self):
-        for tb_name, pk_name in [(DDB_TABLE_EVENTOS, "id_pedido"), (DDB_TABLE_TELEMETRIA, "id_entregador"), (DDB_TABLE_ALOCACAO_ENTREGADOR, "id_entregador")]:
+        for tb_name, pk_name in [(DDB_TABLE_EVENTOS, "id_pedido"), (DDB_TABLE_TELEMETRIA, "id_entregador"), (DDB_TABLE_ALOCACOES, "id_entregador")]:
             try:
                 table = self.ddb.create_table(TableName=tb_name, KeySchema=[{"AttributeName": pk_name, "KeyType": "HASH"}, {"AttributeName": "timestamp", "KeyType": "RANGE"}], AttributeDefinitions=[{"AttributeName": pk_name, "AttributeType": "S"}, {"AttributeName": "timestamp", "AttributeType": "S"}], BillingMode="PAY_PER_REQUEST")
                 table.wait_until_exists()
@@ -243,8 +243,13 @@ class Arquitetura:
                 containerDefinitions=[{
                     "name": "dijkfood-worker-container", "image": "matheuspinto4/dijkfood-worker:latest",
                     "environment": [
-                        {"name": "DB_HOST", "value": self.rds_endpoint}, {"name": "DB_USER", "value": DB_ADMIN_USER}, {"name": "DB_PASS", "value": DB_PASSWORD}, {"name": "DB_NAME", "value": DB_NAME}, {"name": "S3_BUCKET", "value": S3_BUCKET_NAME},
-                        {"name": "API_URL", "value": api_url} # <--- Injeção Dinâmica
+                        {"name": "DB_HOST", "value": self.rds_endpoint}, 
+                        {"name": "DB_USER", "value": DB_ADMIN_USER}, 
+                        {"name": "DB_PASS", "value": DB_PASSWORD}, 
+                        {"name": "DB_NAME", "value": DB_NAME}, 
+                        {"name": "S3_BUCKET", "value": S3_BUCKET_NAME},
+                        {"name": "API_URL", "value": api_url}, 
+                        {"name": "DDB_ALOCACOES", "value": DDB_TABLE_ALOCACOES}
                     ],
                     "logConfiguration": {"logDriver": "awslogs", "options": {"awslogs-group": "/ecs/dijkfood-worker", "awslogs-region": REGION, "awslogs-stream-prefix": "ecs", "awslogs-create-group": "true"}}
                 }]
@@ -292,11 +297,16 @@ class Arquitetura:
 
         try:
             self.rds.delete_db_instance(DBInstanceIdentifier=DB_INSTANCE_ID, SkipFinalSnapshot=True)
+            print("[DESTROY] Aguardando o RDS ser deletado (5-10 min)...")
+            self.rds.get_waiter('db_instance_deleted').wait(DBInstanceIdentifier=DB_INSTANCE_ID, WaiterConfig={"Delay": 30, "MaxAttempts": 40})
         except ClientError: pass
 
+        
         try: self.ddb.Table(DDB_TABLE_EVENTOS).delete()
         except ClientError: pass
         try: self.ddb.Table(DDB_TABLE_TELEMETRIA).delete()
+        except ClientError: pass
+        try: self.ddb.Table(DDB_TABLE_ALOCACOES).delete()
         except ClientError: pass
 
         try:
@@ -305,6 +315,8 @@ class Arquitetura:
                 for obj in objects['Contents']: self.s3.delete_object(Bucket=S3_BUCKET_NAME, Key=obj['Key'])
             self.s3.delete_bucket(Bucket=S3_BUCKET_NAME)
         except ClientError: pass
+
+        
 
         print("[DESTROY] Comandos de exclusão enviados para a AWS!")
 
