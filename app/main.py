@@ -4,28 +4,60 @@ import uuid
 import boto3
 import json
 from enum import Enum
-from datetime import datetime
+from datetime import datetime, date, time as datetime_time
 from typing import Annotated
 
-from datetime import date, time as datetime_time
-from sqlmodel import Field, SQLModel
+from sqlmodel import Field, Session, SQLModel, create_engine, select
 from boto3.dynamodb.conditions import Key
 from pydantic import BaseModel
-from fastapi import Depends, FastAPI, HTTPException, Query
-from sqlmodel import Field, Session, SQLModel, create_engine, select
+from fastapi import Depends, FastAPI, HTTPException
+from botocore.config import Config
 
-# Configurações do DynamoDB
+# ---------------------------------------------------------------------------
+# Configurações AWS & DynamoDB
+# ---------------------------------------------------------------------------
 DYNAMODB_REGION = os.getenv("AWS_REGION", "us-east-1")
-dynamodb = boto3.resource("dynamodb", region_name=DYNAMODB_REGION)
+boto_config = Config(max_pool_connections=50) # Libera 50 conexões simultâneas
+dynamodb = boto3.resource("dynamodb", region_name=DYNAMODB_REGION, config=boto_config)
+
 NOME_TABELA_EVENTOS = os.getenv("DDB_EVENTOS", "dijkfood-historico-eventos")
 tabela_eventos = dynamodb.Table(NOME_TABELA_EVENTOS)
+
 NOME_TABELA_TELEMETRIA = os.getenv("DDB_TELEMETRIA", "dijkfood-telemetria-entregadores")
 tabela_telemetria = dynamodb.Table(NOME_TABELA_TELEMETRIA)
 
-# Configuração de logs para monitorar a API na nuvem
+NOME_TABELA_ALOCACOES = os.getenv("DDB_ALOCACOES", "dijkfood-alocacao-entregadores")
+tabela_alocacoes= dynamodb.Table(NOME_TABELA_ALOCACOES)
+
+# Configuração de logs para monitorar a API na nuvem (CloudWatch)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Conexão com Banco de Dados RDS (PostgreSQL)
+# ---------------------------------------------------------------------------
+DB_HOST = os.getenv("DB_HOST")
+DB_USER = os.getenv("DB_USER")
+DB_PASS = os.getenv("DB_PASS")
+DB_NAME = os.getenv("DB_NAME")
+
+# CORREÇÃO: Monta a URL dinamicamente caso as variáveis do ECS estejam presentes
+DATABASE_URL = os.getenv("DATABASE_URL") or (
+    f"postgresql://{DB_USER}:{DB_PASS}@{DB_HOST}:5432/{DB_NAME}" 
+    if DB_HOST else None
+)
+
+engine = create_engine(DATABASE_URL) if DATABASE_URL else None
+
+def get_session():
+    with Session(engine) as session:
+        yield session
+
+SessionDep = Annotated[Session, Depends(get_session)]
+
+# ---------------------------------------------------------------------------
+# Modelos (SQLModel / Pydantic)
+# ---------------------------------------------------------------------------
 class Cliente(SQLModel, table=True):
     __tablename__ = "clientes"
     id_cliente: int | None = Field(default=None, primary_key=True)
@@ -99,7 +131,10 @@ class Pedido(SQLModel, table=True):
     id_pedido: int | None = Field(default=None, primary_key=True)
     id_cliente: int = Field(foreign_key="clientes.id_cliente")
     id_restaurante: int = Field(foreign_key="restaurantes.id_restaurante")
-    id_entregador: int = Field(foreign_key="entregadores.id_entregador")
+    
+    # CORREÇÃO CRÍTICA: O pedido agora aceita nascer sem entregador!
+    id_entregador: int | None = Field(default=None, foreign_key="entregadores.id_entregador")
+    
     lista_itens: str | None = None
     status: str = Field(default="CONFIRMED")
     data: date | None = None
@@ -110,47 +145,31 @@ class PedidoCreate(BaseModel):
     id_restaurante: int
     lista_itens: list[dict]
 
-# Conexão com a AWS
-DATABASE_URL = os.getenv("DATABASE_URL")
-engine = create_engine(DATABASE_URL) if DATABASE_URL else None
-
-def get_session():
-    with Session(engine) as session:
-        yield session
-
-SessionDep = Annotated[Session, Depends(get_session)]
+# ---------------------------------------------------------------------------
+# Instância da API
+# ---------------------------------------------------------------------------
 app = FastAPI(title="DijkFood API - Produção")
 
-# Criação das rotas
+# ---------------------------------------------------------------------------
+# Rotas: Clientes, Restaurantes e Entregadores
+# ---------------------------------------------------------------------------
 @app.get("/clientes/", response_model=list[Cliente])
 def listar_clientes(session: SessionDep, offset: int = 0, limit: int = 10):
     return session.exec(select(Cliente).offset(offset).limit(limit)).all()
 
 @app.post("/clientes/", response_model=Cliente)
 def criar_cliente(cliente_in: ClienteCreate, session: SessionDep):
-    logger.info(f"Iniciando criação do cliente {cliente_in.nome}")
-
     try:
-        novo_cliente = Cliente(
-                nome = cliente_in.nome,
-                email = cliente_in.email,
-                telefone = cliente_in.telefone,
-                latitude = cliente_in.latitude,
-                longitude = cliente_in.longitude
-        )
+        # Uso do model_dump() deixa o código mais limpo
+        novo_cliente = Cliente(**cliente_in.model_dump())
         session.add(novo_cliente)
-
-        # Só salva se der tudo certo 
         session.commit()
         session.refresh(novo_cliente)
-
-        logger.info(f"Cliente {novo_cliente.id_cliente} criado com sucesso!")
         return novo_cliente
-
     except Exception as e:
-        session.rollback() # Desfaz qualquer mudança parcial em caso de erro
-        logger.error(f"Erro atômico ao criar cliente: {e}")
-        raise HTTPException(status_code=500, detail="Erro interno ao processar o cliente")
+        session.rollback()
+        logger.error(f"Erro ao criar cliente: {e}")
+        raise HTTPException(status_code=500, detail="Erro interno")
 
 @app.get("/restaurantes/", response_model=list[Restaurante])
 def listar_restaurantes(session: SessionDep, offset: int = 0, limit: int = 10):
@@ -158,28 +177,16 @@ def listar_restaurantes(session: SessionDep, offset: int = 0, limit: int = 10):
 
 @app.post("/restaurantes/", response_model=Restaurante)
 def criar_restaurante(restaurante_in: RestauranteCreate, session: SessionDep):
-    logger.info(f"Iniciando criação do restaurante {restaurante_in.nome}")
-
     try:
-        novo_restaurante = Restaurante(
-                nome = restaurante_in.nome,
-                tipo_cozinha = restaurante_in.tipo_cozinha,
-                latitude = restaurante_in.latitude,
-                longitude = restaurante_in.longitude
-        )
+        novo_restaurante = Restaurante(**restaurante_in.model_dump())
         session.add(novo_restaurante)
-
-        # Só salva se der tudo certo 
         session.commit()
         session.refresh(novo_restaurante)
-
-        logger.info(f"Restaurante {novo_restaurante.id_restaurante} criado com sucesso!")
         return novo_restaurante
-
     except Exception as e:
-        session.rollback() # Desfaz qualquer mudança parcial em caso de erro
-        logger.error(f"Erro atômico ao criar restaurante: {e}")
-        raise HTTPException(status_code=500, detail="Erro interno ao processar o restaurante")
+        session.rollback()
+        logger.error(f"Erro ao criar restaurante: {e}")
+        raise HTTPException(status_code=500, detail="Erro interno")
 
 @app.get("/entregadores/", response_model=list[Entregador])
 def listar_entregadores(session: SessionDep, offset: int = 0, limit: int = 10):
@@ -187,38 +194,24 @@ def listar_entregadores(session: SessionDep, offset: int = 0, limit: int = 10):
 
 @app.post("/entregadores/", response_model=Entregador)
 def criar_entregador(entregador_in: EntregadorCreate, session: SessionDep):
-    logger.info(f"Iniciando criação do entregador {entregador_in.nome}")
-
     try:
-        novo_entregador = Entregador(
-                nome = entregador_in.nome,
-                tipo_veiculo = entregador_in.tipo_veiculo,
-                latitude = entregador_in.latitude,
-                longitude = entregador_in.longitude
-        )
+        novo_entregador = Entregador(**entregador_in.model_dump())
         session.add(novo_entregador)
-
-        # Só salva se der tudo certo 
         session.commit()
         session.refresh(novo_entregador)
-
-        logger.info(f"Entregador {novo_entregador.id_entregador} criado com sucesso!")
         return novo_entregador
-
     except Exception as e:
-        session.rollback() # Desfaz qualquer mudança parcial em caso de erro
-        logger.error(f"Erro atômico ao criar entregador: {e}")
-        raise HTTPException(status_code=500, detail="Erro interno ao processar o entregador") 
+        session.rollback()
+        logger.error(f"Erro ao criar entregador: {e}")
+        raise HTTPException(status_code=500, detail="Erro interno")
 
 @app.post("/entregadores/{id_entregador}/posicao")
 def atualizar_posicao(id_entregador: int, posicao: PosicaoUpdate):
     try:
         tabela_telemetria.put_item(
             Item={
-                # O deploy.py definiu essa chave como String (S)
                 "id_entregador": str(id_entregador), 
                 "timestamp": datetime.utcnow().isoformat(),
-                # Convertendo para string para evitar problemas de float no DynamoDB
                 "latitude": str(posicao.latitude),
                 "longitude": str(posicao.longitude)
             }
@@ -228,9 +221,11 @@ def atualizar_posicao(id_entregador: int, posicao: PosicaoUpdate):
         logger.error(f"Erro ao salvar telemetria: {e}")
         raise HTTPException(status_code=500, detail="Erro ao salvar posição")
 
+# ---------------------------------------------------------------------------
+# Rotas: Pedidos
+# ---------------------------------------------------------------------------
 @app.get("/pedidos/", response_model=list[Pedido])
 def listar_pedidos(session: SessionDep, offset: int = 0, limit: int = 10):
-    # Requisito: Administrador deve consultar o histórico de pedidos
     return session.exec(select(Pedido).offset(offset).limit(limit)).all()
 
 @app.get("/pedidos/{id_pedido}", response_model=Pedido)
@@ -242,117 +237,112 @@ def consultar_pedido(id_pedido: int, session: SessionDep):
 
 @app.post("/pedidos/", response_model=Pedido)
 def criar_pedido(pedido_in: PedidoCreate, session: SessionDep):
-    logger.info(f"Iniciando criação de pedido para Cliente {pedido_in.id_cliente}")
-
-    # Verifica se Cliente existe
     cliente = session.get(Cliente, pedido_in.id_cliente)
-    if not cliente:
-        raise HTTPException(status_code=404, detail="Cliente não encontrado")
-
-    # Verifica se Restaurante existe
     restaurante = session.get(Restaurante, pedido_in.id_restaurante)
-    if not restaurante:
-        raise HTTPException(status_code=404, detail="Restaurante não encontrado")
-
-    # Busca o primeiro entregador disponível 
-    entregador = session.exec(
-        select(Entregador).where(Entregador.status == "AVAILABLE")
-    ).first()
-
-    if not entregador:
-        raise HTTPException(status_code=400, detail="Nenhum entregador disponível no momento")
+    if not cliente or not restaurante:
+        raise HTTPException(status_code=404, detail="Cliente ou Restaurante não encontrado")
 
     try:
-        # 4. Muda o status do entregador para ocupado
-        entregador.status = "BUSY"
-        session.add(entregador)
-
         novo_pedido = Pedido(
             id_cliente=cliente.id_cliente,
             id_restaurante=restaurante.id_restaurante,
-            id_entregador=entregador.id_entregador,
+            id_entregador=None, # O pedido entra na fila órfão, o Worker assume depois!
             lista_itens=json.dumps(pedido_in.lista_itens)
         )
         session.add(novo_pedido)
-
         session.flush()
 
         tabela_eventos.put_item(
             Item={
-                "id_pedido": f"PEDIDO#{novo_pedido.id_pedido}",
+                "id_pedido": str(novo_pedido.id_pedido),
                 "timestamp": datetime.utcnow().isoformat(),
-                "status": novo_pedido.status, # Que por padrão é "CONFIRMED"
-                "event_id": uuid.uuid4().hex[:8]
+                "status": novo_pedido.status,
+                "event_id": uuid.uuid4().hex[:8],
+                "id_entregador": None
             }
         )
         
-        # Só salva se der tudo certo 
         session.commit()
         session.refresh(novo_pedido)
-        
-        logger.info(f"Pedido {novo_pedido.id_pedido} criado com sucesso!")
         return novo_pedido
 
     except Exception as e:
-        session.rollback() # Desfaz qualquer mudança parcial em caso de erro
-        logger.error(f"Erro atômico ao criar pedido: {e}")
-        raise HTTPException(status_code=500, detail="Erro interno ao processar o pedido")
+        session.rollback()
+        logger.error(f"Erro ao criar pedido: {e}")
+        raise HTTPException(status_code=500, detail="Erro ao processar o pedido")
 
 @app.get("/pedidos/{id_pedido}/acompanhamento")
-def acompanhar_pedido(id_pedido: int, session: SessionDep):
-    # 1. Busca o status atualizado no RDS
-    pedido = session.get(Pedido, id_pedido)
-    if not pedido:
-        raise HTTPException(status_code=404, detail="Pedido não encontrado")
+def acompanhar_pedido(id_pedido: int): 
+    # 1. Busca o status atualizado do pedido no DynamoDB
+    try:
+        resposta = tabela_eventos.query(
+            KeyConditionExpression=Key('id_pedido').eq(str(id_pedido)),
+            ScanIndexForward=False, 
+            Limit=1
+        )
+        itens = resposta.get('Items', [])
+    except Exception as e:
+        logger.error(f"Falha real de comunicação com DynamoDB: {e}")
+        raise HTTPException(status_code=500, detail="Erro ao conectar com o histórico de eventos.")
+
+    # A validação 404 agora está 100% protegida fora do try
+    if not itens:
+        raise HTTPException(status_code=404, detail="Nenhum status encontrado para este pedido.")
+
+    # ATENÇÃO: 'pedido_dict' é um Dicionário JSON, usamos .get() em vez de pontos
+    pedido_dict = itens[0]
+    status_atual = pedido_dict.get("status")
+    id_entregador_str = pedido_dict.get("id_entregador")
 
     # 2. Busca a última posição do entregador no DynamoDB
     ultima_posicao = None
-    try:
-        resposta = tabela_telemetria.query(
-            KeyConditionExpression=Key('id_entregador').eq(str(pedido.id_entregador)),
-            ScanIndexForward=False, # Truque: Traz os dados de trás pra frente (o mais recente primeiro)
-            Limit=1 # Pega apenas a 1ª linha
-        )
-        itens = resposta.get('Items', [])
-        if itens:
-            ultima_posicao = {
-                "latitude": float(itens[0]["latitude"]),
-                "longitude": float(itens[0]["longitude"]),
-                "ultima_atualizacao": itens[0]["timestamp"]
-            }
-    except Exception as e:
-        logger.error(f"Erro ao buscar telemetria do entregador {pedido.id_entregador}: {e}")
-        # Não quebramos a requisição se o GPS falhar, apenas retornamos sem a posição
+    if id_entregador_str and id_entregador_str != "None":
+        try:
+            resp_telemetria = tabela_telemetria.query(
+                KeyConditionExpression=Key('id_entregador').eq(id_entregador_str),
+                ScanIndexForward=False,
+                Limit=1 
+            )
+            itens_pos = resp_telemetria.get('Items', [])
+            if itens_pos:
+                ultima_posicao = {
+                    "latitude": float(itens_pos[0]["latitude"]),
+                    "longitude": float(itens_pos[0]["longitude"]),
+                    "ultima_atualizacao": itens_pos[0]["timestamp"]
+                }
+        except Exception as e:
+            logger.error(f"Erro ao buscar telemetria, mas ignorando para o usuário: {e}")
+            pass
 
     # 3. Junta tudo e devolve para o cliente
     return {
-        "id_pedido": pedido.id_pedido,
-        "status": pedido.status,
-        "id_entregador": pedido.id_entregador,
+        "id_pedido": id_pedido,
+        "status": status_atual,
+        "id_entregador": int(id_entregador_str) if id_entregador_str and id_entregador_str != "None" else None,
         "posicao_entregador": ultima_posicao
     }
 
 @app.patch("/pedidos/{id_pedido}/status", response_model=Pedido)
 def atualizar_status_pedido(id_pedido: int, update_data: PedidoStatusUpdate, session: SessionDep):
-    # 1. Busca o pedido no RDS
     pedido = session.get(Pedido, id_pedido)
     if not pedido:
         raise HTTPException(status_code=404, detail="Pedido não encontrado")
 
+    # Se não for a criação inicial (CONFIRMED), é exigido que já exista um entregador associado
+    if update_data.novo_status not in (StatusPedido.CONFIRMED, StatusPedido.READY_FOR_PICKUP, StatusPedido.PREPARING) and pedido.id_entregador is None:
+        raise HTTPException(status_code=400, detail="O pedido ainda não possui entregador.")
+
     status_atual = pedido.status
     novo_status = update_data.novo_status.value
-
-    # 2. Validação estrita da Máquina de Estados
     status_esperado = TRANSICOES_VALIDAS.get(status_atual)
+    
     if status_esperado != novo_status:
-        logger.warning(f"Tentativa de transição ilegal no Pedido {id_pedido}: {status_atual} -> {novo_status}")
         raise HTTPException(
             status_code=400,
-            detail=f"Transição inválida. O pedido está '{status_atual}', o próximo status deve ser '{status_esperado}'"
+            detail=f"Transição inválida. De {status_atual} deve ir para {status_esperado}"
         )
 
     try:
-        # 3. Atualiza o status principal no AWS RDS
         pedido.status = novo_status
         session.add(pedido)
         session.commit()
@@ -362,20 +352,19 @@ def atualizar_status_pedido(id_pedido: int, update_data: PedidoStatusUpdate, ses
         # Usamos o formato "PEDIDO#123" para bater com a chave de partição (Partition Key) do seu script
         tabela_eventos.put_item(
             Item={
-                "id_pedido": f"PEDIDO#{id_pedido}",
+                "id_pedido": str(id_pedido),
                 "timestamp": datetime.utcnow().isoformat(),
                 "status": novo_status,
-                "event_id": uuid.uuid4().hex[:8]
+                "event_id": uuid.uuid4().hex[:8],
+                "id_entregador": str(pedido.id_entregador)
             }
         )
-
-        logger.info(f"Pedido {id_pedido} avançou para {novo_status}")
         return pedido
 
     except Exception as e:
         session.rollback()
-        logger.error(f"Falha ao processar mudança de status do pedido {id_pedido}: {e}")
-        raise HTTPException(status_code=500, detail="Erro interno de comunicação com os bancos de dados.")
+        logger.error(f"Erro ao atualizar status: {e}")
+        raise HTTPException(status_code=500, detail="Erro de comunicação com banco de dados")
 
 @app.get("/pedidos/{id_pedido}/historico")
 def historico_pedido(id_pedido: int):
@@ -383,7 +372,7 @@ def historico_pedido(id_pedido: int):
     try:
         resposta = tabela_eventos.query(
             # Busca todos os eventos que pertencem a este pedido
-            KeyConditionExpression=Key('id_pedido').eq(f"PEDIDO#{id_pedido}"),
+            KeyConditionExpression=Key('id_pedido').eq(str(id_pedido)),
             # ScanIndexForward=True garante a ordem do mais antigo para o mais novo
             ScanIndexForward=True 
         )
@@ -396,8 +385,59 @@ def historico_pedido(id_pedido: int):
     except Exception as e:
         logger.error(f"Erro ao buscar histórico do pedido {id_pedido}: {e}")
         raise HTTPException(status_code=500, detail="Erro ao conectar com o histórico de eventos.")
+    
 
-# Rotas otimizadas para o simulador, as outras faziam o computador morrer
+@app.get("/alocacoes/{id_entregador}/acompanhamento")
+def consultar_alocacao(id_entregador: int): 
+    # 1. Busca em qual pedido o entregador esta alocado no DynamoDB
+    try:
+        resposta = tabela_alocacoes.query(
+            KeyConditionExpression=Key('id_entregador').eq(str(id_entregador)),
+            ScanIndexForward=False, 
+            Limit=1
+        )
+        itens = resposta.get('Items', [])
+    except Exception as e:
+        logger.error(f"Falha real de comunicação com DynamoDB: {e}")
+        raise HTTPException(status_code=500, detail="Erro ao conectar com o histórico de alocacoes.")
+
+    id_pedido_str = None
+    rota_restaurante = None
+    rota_cliente = None
+    if itens:
+        entregador_dict = itens[0]
+        if entregador_dict.get("status") == "ATIVO":
+            id_pedido_str = entregador_dict.get("id_pedido")
+            rota_restaurante = entregador_dict.get("rota_restaurante")
+            rota_cliente = entregador_dict.get("rota_cliente")
+
+    # Falta adicionar a rota --------------
+    # 2. Junta tudo e devolve para o entregador
+    return {
+        "id_entregador": id_entregador,
+        "id_pedido": id_pedido_str,
+        "rota_restaurante": rota_restaurante,
+        "rota_cliente": rota_cliente
+    }
+    
+@app.post("/alocacoes/{id_entregador}/desativar/{id_pedido}")
+def desativar_alocacao(id_entregador, id_pedido):
+    try:
+        tabela_alocacoes.put_item(
+            Item={
+                "id_entregador": str(id_entregador),
+                "timestamp": datetime.utcnow().isoformat(),
+                "status": "INATIVA",
+                "id_pedido": id_pedido,
+                "rota_restaurante": None,
+                "rota_cliente": None
+            }
+        )
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Erro ao desativar a alocacao")
+
+# Rotas Otimizadas para o Simulador (Bulk Insert)
 @app.post("/clientes/bulk")
 def criar_clientes_bulk(clientes_in: list[ClienteCreate], session: SessionDep):
     novos = [Cliente(nome=c.nome, email=c.email, telefone=c.telefone, latitude=c.latitude, longitude=c.longitude) for c in clientes_in]

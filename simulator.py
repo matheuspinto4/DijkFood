@@ -14,6 +14,7 @@ N_ENTREGADORES = 3 * N_CLIENTES
 N_DDB_ITEMS    = 50000
 
 URL = "http://localhost:8000"
+# URL = "http://dijkfood-api-alb-980772795.us-east-1.elb.amazonaws.com"
 CONCURRENCY = 40
 VOLUMES = {
     "OPERACAO_NORMAL": 10,
@@ -23,28 +24,45 @@ VOLUMES = {
 RITMO_EXEC = [
     {
         "volume": "OPERACAO_NORMAL",
-        "duracao": 1#60
+        "duracao": 3#10#60
     },
-    {
-        "volume": "PICO",
-        "duracao": 1#20
-    },
-    {
-        "volume": "EVENTO_ESPECIAL",
-        "duracao": 1#40
-    },
-    {
-        "volume": "OPERACAO_NORMAL",
-        "duracao": 1#20
-    },
-    {
-        "volume": "PICO",
-        "duracao": 1#40
-    }
+    # {
+    #     "volume": "PICO",
+    #     "duracao": 20
+    # },
+    # {
+    #     "volume": "EVENTO_ESPECIAL",
+    #     "duracao": 40
+    # },
+    # {
+    #     "volume": "OPERACAO_NORMAL",
+    #     "duracao": 20
+    # },
+    # {
+    #     "volume": "PICO",
+    #     "duracao": 40
+    # }
 ]
 
+# ================================ MUDEI AQUI ============================
+# async def worker(semaphore, client, url, json, results, id_register):
+#     async with semaphore:
+#         response = await client.post(
+#             url,
+#             json=json
+#         )
+        
+#         if response.status_code == 200:
+#             # Extrai o JSON da resposta antes de acessar a chave
+#             data = response.json()
+#             results.append(data[id_register]) 
+#         else:
+#             print(f"Erro ao inserir na rota {url}: {response.text}")
+            
+#         return response.status_code
+# ================================================================================
 
-async def preload(jsons, url, id_register, ids):
+async def preload(jsons, url):
     print(f"Enviando lote de {len(jsons)} registros para {url}bulk ...")
     
     # Timeout generoso de 60s apenas para garantir que o banco grave tudo
@@ -53,11 +71,9 @@ async def preload(jsons, url, id_register, ids):
         
         if response.status_code == 200:
             print(f"Sucesso! {len(jsons)} inseridos.")
-            # Como limpamos o banco antes, sabemos que os IDs gerados serão de 1 até N
-            ids[id_register] = list(range(1, len(jsons) + 1))
         else:
             print(f"Erro fatal no Bulk Insert: {response.text}")
-            raise Exception("Falha ao popular o banco de dados!")
+            raise Exception(f"Falha ao popular o banco de dados!, {url + "bulk"}, {jsons}")
 
 
 async def requester(queue, results):
@@ -76,7 +92,43 @@ async def requester(queue, results):
                         item["url"],
                         # params=item.get("params")
                     )
-                elif method == "POST":
+                    id_pedido = response.get("id_pedido", None)
+                    id_entregador = response.get("id_entregador", None)
+                    status = response.get("status", None)
+                    # Tratamento de entregadores que foram alocados em um pedido (de desocupados para ocupados)
+                    if item["user"] == "courier" and id_pedido and id_entregador:
+                        async with entregadores_desocupados_lock:
+                            posicao = entregadores_desocupados[id_entregador]["posicao"]
+                            del entregadores_desocupados[id_entregador]
+                        async with entregadores_ocupados_lock:
+                            entregadores_ocupados[id_entregador] = {
+                                "id_pedido": id_pedido,
+                                "posicao": posicao,
+                                "edge_idx": 0,
+                                "rota_atual": "rota_restaurante",
+                                "deslocamento_atual": [None, None, None]
+                            }
+                    elif item["user"] == "client" and status and id_pedido:
+                        # Tratamento de mudanca de estados do pedido (simulando restaurante)
+                        prob = random.random()
+                        novo_status = None
+                        if status == "CONFIRMED" and prob <= 0.95:
+                            novo_status = "PREPARING"
+                        elif status == "PREPARING" and prob <= 0.85:
+                            novo_status = "READY_FOR_PICKUP"
+
+                        if novo_status:
+                            await queue.put({
+                                "method": "PATCH",
+                                "url": f"{URL}/pedidos/{id_pedido}/status",
+                                "json": {"novo_status": novo_status}, 
+                                "ritmo_idx": ritmo_idx
+                            })
+                            async with orders_lock:
+                                orders[id_pedido]["status"] = novo_status
+
+
+                elif method in ("POST", "PATCH"):
                     response = await client.post(
                         item["url"],
                         json=item.get("json")
@@ -104,64 +156,242 @@ async def requester(queue, results):
             queue.task_done()
             
 
-async def producer_order(queue, volume, duration, ritmo_idx, clientes, restaurantes):
+async def producer_order(queue, volume, duracao, ritmo_idx, clientes, restaurantes):
     start = time.perf_counter()
     orders_acum = 0
 
-    while time.perf_counter() - start < duration:
+    while time.perf_counter() - start < duracao:
         # Produz pedidos seguindo uma distribuicao de poisson
         delta = random.expovariate(volume)
         await asyncio.sleep(delta)
-
-        async with orders_lock:
-            order_id = orders_acum
-            orders.append(order_id)
-            orders_acum += 1
 
         # Escolhe aleatoriamente um cliente e um restaurante
         id_cli = random.choice(clientes)
         id_res = random.choice(restaurantes)
         json = {"id_cliente": id_cli, "id_restaurante": id_res, "lista_itens": []}
+
+        async with orders_lock:
+            order_id = orders_acum
+            orders[order_id] = {"id_cliente": id_cli, "id_restaurante": id_res, "status": "CONFIRMED"}
+            orders_acum += 1
         
         await queue.put({
             "method": "POST",
-            "url": f"{URL}/pedidos",
+            "url": f"{URL}/pedidos/",
             "json": json, 
             "ritmo_idx": ritmo_idx
         })
 
 
-async def viewer_order(queue, duration, ritmo_idx):
+async def viewer_order(queue, volume, duracao, ritmo_idx):
     start = time.perf_counter()
     await asyncio.sleep(start + 1 - time.perf_counter())
-    current_sec = 1
     
     # Comeca no final do primeiro segundo e termina no final do ultimo (depois da criacao do ultimo pedido)
-    while time.perf_counter() - start < duration + 1:
+    while time.perf_counter() - start < duracao + 1:
         async with orders_lock:
-            current_orders = list(orders)
+            current_orders = dict(orders)
         
         if not current_orders:
             await asyncio.sleep(0.01)
             continue
         
-        # Consulta todos os pedidos disponiveis no segundo atual de forma uniforme
-        times = sorted(start + current_sec + random.uniform(0, 1) for _ in current_orders)
-        for order_id, time_exec in zip(current_orders, times):
-            # Pula para o tempo sorteado para a execucao
-            delta = time_exec - time.perf_counter()
-            await asyncio.sleep(max(0, delta))
+        # Escolhe aleatoriamente um pedido
+        order_id = random.choice(list(current_orders.keys()))
+
+        # Produz visualizacoes de pedidos seguindo uma distribuicao de poisson
+        delta = random.expovariate(volume)
+        await asyncio.sleep(delta)
             
+        await queue.put({
+            "method": "GET",
+            "url": f"{URL}/pedidos/{order_id}/acompanhamento",
+            "params": {}, 
+            "ritmo_idx": ritmo_idx,
+            "user": "client"
+        })
+
+async def move_courier(id_entregador):
+    # Considera a velocidade constante de 60Km/h = 1/600 metros/100ms
+    def compute_new_desl(entregador):
+        edge_idx = entregador["edge_idx"]
+        rota_atual = entregador["rota_atual"]
+        (lat, long), (new_lat, new_long), metros = entregador[rota_atual][edge_idx]
+        dist_100ms = int(600 * metros + 0.5)
+        lat_desl, long_desl = (new_lat - lat)/dist_100ms, (new_long - long)/dist_100ms
+        entregador["deslocamento_atual"] = [lat_desl, long_desl, dist_100ms]
+        entregador["posicao"] = lat, long
+
+    async with entregadores_ocupados_lock:
+        couriers = dict(entregadores_ocupados)
+
+    entregador = couriers.get(id_entregador, None)
+    if not entregador:
+        return None, None, None
+    elif not all(entregador["deslocamento_atual"]): # Inicia a rota ate o restaurante
+        entregador["rota_atual"] = "rota_restaurante"
+        entregador["edge_idx"] = 0
+        compute_new_desl(entregador)
+
+    mudanca_rota = False
+    entregador["deslocamento_atual"][2] -= 1
+    lat, long = entregador["posicao"]
+    lat_desl, long_desl, dist_100ms = entregador["deslocamento_atual"]
+    # Muda a aresta ao chegar ao final dela
+    if dist_100ms <= 0:
+        rota_atual = entregador["rota_atual"]
+        if rota_atual == "rota_restaurante":
+            # Espera ate o pedido estar pronto para ser coletado
+            id_pedido = entregador.id_pedido
+            async with orders_lock:
+                status = orders[id_pedido]["status"]
+            if status != "READY_FOR_PICKUP":
+                return lat, long, None
+            
+            # Caso esteja pronto, coleta o pedido, atualiza a rota e o status do pedido
+            entregador["rota_atual"] = "rota_cliente"
+            entregador["edge_idx"] = 0
+            async with orders_lock:
+                orders[id_pedido]["status"] = "IN_TRANSIT"
+            compute_new_desl(entregador)
+            mudanca_rota = True
+        elif rota_atual == "rota_cliente":
+            entregador["rota_atual"] = None
+            return None, None, None
+        
+    entregador["posicao"] = lat + lat_desl, long + long_desl 
+    async with entregadores_ocupados_lock:
+        entregadores_ocupados[id_entregador] = entregador
+
+    return *entregador["posicao"], mudanca_rota
+
+
+async def updater_courier(queue, volume, duracao, ritmo_idx):
+    start = time.perf_counter()
+    current_100ms = 0.0
+    volume *= 3
+    
+    while time.perf_counter() - start < duracao:
+        couriers = None
+        async with entregadores_ocupados_lock:
+            couriers = dict(entregadores_ocupados)
+        
+        if not couriers:
+            await asyncio.sleep(0.01)
+            continue
+
+        # Cada entregador ocupado atualiza sua posicao ate o fim do pedido
+        times = []
+        while len(times) < volume:
+            delta = random.expovariate(volume)
+            if delta >= 1: continue
+            times.append(delta)
+        times = sorted(times)
+        for id_entregador, each_time in zip(list(couriers.keys()), times):
+            lat, long, mudanca_rota = move_courier(id_entregador)
+            # Caso tenha acabado a corrida, desativa a sua alocacao e conclui o pedido
+            if not lat or not long: 
+                id_pedido = couriers[id_entregador]["id_pedido"]
+                await queue.put({
+                    "method": "POST",
+                    "url": f"{URL}/alocacoes/{id_entregador}/desativar/{id_pedido}",
+                    "json": {}, 
+                    "ritmo_idx": ritmo_idx
+                })
+                await queue.put({
+                    "method": "PATCH",
+                    "url": f"{URL}/pedidos/{id_pedido}/status",
+                    "json": {"novo_status": "DELIVERED"}, 
+                    "ritmo_idx": ritmo_idx
+                })
+                async with orders_lock:
+                    del orders[id_pedido]
+                # Sai de ocupado e volta para desocupado
+                async with entregadores_ocupados_lock:
+                    posicao = entregadores_ocupados[id_entregador]["posicao"]
+                    del entregadores_ocupados[id_entregador]
+                async with entregadores_desocupados_lock:
+                    entregadores_desocupados[id_entregador] = {"posicao": posicao}
+            else:
+                # Do contrario, so atualiza sua posicao
+                json = {"latitude": lat, "latitude": long}
+                await queue.put({
+                    "method": "POST",
+                    "url": f"{URL}/entregadores/{id_entregador}/posicao",
+                    "json": json, 
+                    "ritmo_idx": ritmo_idx
+                })
+                # Caso tenha coletado o pedido e esteja em direcao ao cliente, atualiza nas bases
+                if mudanca_rota:
+                    await queue.put({
+                        "method": "PATCH",
+                        "url": f"{URL}/pedidos/{id_pedido}/status",
+                        "json": {"novo_status": "PICKED_UP"}, 
+                        "ritmo_idx": ritmo_idx
+                    })
+                    await queue.put({
+                        "method": "PATCH",
+                        "url": f"{URL}/pedidos/{id_pedido}/status",
+                        "json": {"novo_status": "IN_TRANSIT"}, 
+                        "ritmo_idx": ritmo_idx
+                    })
+            delta = start + current_100ms + each_time - time.perf_counter()
+            await asyncio.sleep(max(delta, 0))
+
+        # Atualiza a cada 100ms
+        current_100ms += 0.1
+        delta = start + current_100ms - time.perf_counter()
+        await asyncio.sleep(max(delta, 0))
+
+
+async def viewer_courier(queue, volume, duracao, ritmo_idx):
+    start = time.perf_counter()
+    current_second = 0
+    volume *= 3
+
+    times = []
+    while len(times) < volume:
+        delta = random.expovariate(volume)
+        if delta >= 1: continue
+        times.append(delta)
+    times = sorted(times)
+    while time.perf_counter() - start < duracao:
+        # Cada entregador desocupado fica esperando um pedido
+        for each_time in times:
+            couriers = None
+            async with entregadores_desocupados_lock:
+                couriers = list(entregadores_desocupados.keys())
+            
+            if not couriers:
+                await asyncio.sleep(0.01)
+                continue
+            
+            id_entregador = random.choice(couriers)
+
+            delta = start + current_second + each_time - time.perf_counter()
+            await asyncio.sleep(max(delta, 0))
+
             await queue.put({
                 "method": "GET",
-                "url": f"{URL}/pedidos/{order_id}/acompanhamento",
-                "params": {}, 
-                "ritmo_idx": ritmo_idx
+                "url": f"{URL}/alocacoes/{id_entregador}/acompanhamento",
+                "params": {},
+                "ritmo_idx": ritmo_idx,
+                "user": "courier"
             })
-        current_sec += 1
 
-orders = []
+        # Dorme ate o proximo segundo
+        current_second += 1
+        delta = start + current_second - time.perf_counter()
+        await asyncio.sleep(max(delta, 0))
+        
+
+
+orders = {}
 orders_lock = asyncio.Lock()
+entregadores_desocupados = {}
+entregadores_desocupados_lock = asyncio.Lock()
+entregadores_ocupados = {}
+entregadores_ocupados_lock = asyncio.Lock()
 
 async def main():
     # Popular o sistema com dados basicos
@@ -174,7 +404,7 @@ async def main():
 
     # No main.py essas taks possuem uma barra no final, mudei aqui
     tasks = [
-        preload(jsons, URL + path, id_register, ids)
+        preload(jsons, URL + path)
         for jsons, path, id_register in zip(
             data,
             ["/clientes/", "/restaurantes/", "/entregadores/"],
@@ -182,9 +412,16 @@ async def main():
         )
     ]
     await asyncio.gather(*tasks)
-    clientes = ids["id_cliente"]
-    restaurantes = ids["id_restaurante"]
-    
+    clientes = list(range(1, N_CLIENTES+1))
+    restaurantes = list(range(1, N_CLIENTES+1))
+    async with entregadores_desocupados_lock:
+        entregadores_desocupados = {
+            id_entregador: {"posicao": [lat, long]} 
+            for id_entregador, [lat, long] in zip(
+                list(range(1, N_CLIENTES+1)), 
+                [[v["latitude"], v["longitude"]] for v in data[2].values()]
+            )
+        }  
     
     # Cliente pode consultar o status do pedido (estado, entregador e posicao)
     # API deve responder em menos de 500ms no 95 percentil
@@ -203,7 +440,9 @@ async def main():
         duracao = ritmo["duracao"]
         producers = [
             asyncio.create_task(producer_order(queue, volume, duracao, idx, clientes, restaurantes)),
-            asyncio.create_task(viewer_order(queue, duracao, idx)),
+            asyncio.create_task(viewer_order(queue, volume, duracao, idx)),
+            asyncio.create_task(updater_courier(queue, volume, duracao, ritmo_idx)),
+            asyncio.create_task(viewer_courier(queue, volume, duracao, ritmo_idx))
         ]
 
         await asyncio.gather(*producers)
