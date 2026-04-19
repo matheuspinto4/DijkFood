@@ -1,0 +1,7 @@
+fastapi[standard]
+uvicorn
+sqlmodel
+boto3
+botocore
+psycopg2-binary
+pydantic

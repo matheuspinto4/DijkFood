@@ -252,7 +252,7 @@ def main():
                         Item={
                             "id_entregador": str(melhor_entregador),
                             "timestamp": datetime.utcnow().isoformat(),
-                            "status": "ATIVA",
+                            "status": "ATIVO",
                             "id_pedido": id_pedido,
                             "rota_restaurante": rota_restaurante,
                             "rota_cliente": rota_cliente

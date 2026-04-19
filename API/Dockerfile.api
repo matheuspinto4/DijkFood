@@ -1,0 +1,15 @@
+# Usa uma imagem oficial do Python, versão leve
+FROM python:3.11-slim
+
+# Copia o arquivo de dependências e instala
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copia o código da API para dentro do container
+COPY main.py .
+
+# Expõe a porta 80 (que é a que o Load Balancer da AWS vai procurar)
+EXPOSE 80
+
+# Inicia a API usando o Uvicorn na porta 80
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "80"]

@@ -62,11 +62,13 @@ API_PORT         = 80
 # CONFIGURAÇÕES DO SIMULADOR
 # ─────────────────────────────────────────────────────────────────────────────
 N_CLIENTES     = 2  
-N_RESTAURANTES = 10 
-N_ENTREGADORES = 4  
+N_RESTAURANTES = 2 
+N_ENTREGADORES = 10
 CONCURRENCY = 40
-VELOCIDADE_KMH = 60
+VELOCIDADE_KMH = 2000
 fator = 18 / (VELOCIDADE_KMH * 0.1) 
+# A linha de cálculo ficaria assim:
+
 
 # A URL será preenchida automaticamente pelo script antes do simulador rodar
 GLOBAL_API_URL = "" 
@@ -79,7 +81,7 @@ VOLUMES = {
 RITMO_EXEC = [
     {
         "volume": "OPERACAO_NORMAL",
-        "duracao": 60 
+        "duracao": 300 
     }
 ]
 
@@ -421,11 +423,11 @@ async def requester(queue, results):
                     else:  
                         response = await client.patch(item["url"], json=item["json"])
                     
-                    if item["user"] == "courier" and item["json"].get("novo_status", "") == "":
+                    if item["user"] == "courier" and item["json"].get("novo_status", "") == "PICKED_UP":
                         await queue.put({
                             "method": "PATCH",
                             "url": item["url"],
-                            "json": {"novo_status": "PICKED_UP"}, 
+                            "json": {"novo_status": "IN_TRANSIT"}, 
                             "ritmo_idx": item["ritmo_idx"],
                             "user": "courier"
                         })
