@@ -58,29 +58,41 @@ TG_NAME          = "dijkfood-api-tg"
 API_PORT         = 80 
 
 
+CPU_WORKER = 1024
+MEMORY_WORKER = 2048
+CPU_API = 1024
+MEMORY_API = 2048
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURAÇÕES DO SIMULADOR
 # ─────────────────────────────────────────────────────────────────────────────
-N_CLIENTES     = 2  
-N_RESTAURANTES = 2 
-N_ENTREGADORES = 10
-CONCURRENCY = 40
+# MUDANÇA: Aumentado para haver tráfego de verdade com o limite de 1 pedido por cliente
+N_CLIENTES     = 20  
+N_RESTAURANTES = 20 
+N_ENTREGADORES = 20
+CONCURRENCY = 200
 VELOCIDADE_KMH = 2000
 fator = 18 / (VELOCIDADE_KMH * 0.1) 
-# A linha de cálculo ficaria assim:
 
 
-# A URL será preenchida automaticamente pelo script antes do simulador rodar
 GLOBAL_API_URL = "" 
 
 VOLUMES = {
-    "OPERACAO_NORMAL": 10,
-    "PICO": 50,
-    "EVENTO_ESPECIAL": 200
+    "OPERACAO_NORMAL": 100,
+    "PICO": 500,
+    "EVENTO_ESPECIAL": 2000
 }
 RITMO_EXEC = [
     {
         "volume": "OPERACAO_NORMAL",
+        "duracao": 300 
+    },
+    {
+        "volume": "PICO",
+        "duracao": 300
+    },
+    {
+        "volume": "EVENTO_ESPECIAL",
         "duracao": 300 
     }
 ]
@@ -92,6 +104,10 @@ entregadores_desocupados = {}
 entregadores_desocupados_lock = asyncio.Lock()
 entregadores_ocupados = {}
 entregadores_ocupados_lock = asyncio.Lock()
+
+# --- NOVO: Sistema de fila de clientes ---
+clientes_esperando = set()
+clientes_lock = asyncio.Lock()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -268,7 +284,7 @@ class Arquitetura:
         # 2. SERVIÇO DA API
         try:
             api_task = self.ecs.register_task_definition(
-                family="dijkfood-api-task", networkMode="awsvpc", executionRoleArn=LAB_ROLE_ARN, taskRoleArn=LAB_ROLE_ARN, requiresCompatibilities=["FARGATE"], cpu="256", memory="512",
+                family="dijkfood-api-task", networkMode="awsvpc", executionRoleArn=LAB_ROLE_ARN, taskRoleArn=LAB_ROLE_ARN, requiresCompatibilities=["FARGATE"], cpu=f"{CPU_API}", memory=f"{MEMORY_API}",
                 containerDefinitions=[{
                     "name": "dijkfood-api-container", "image": "matheuspinto4/dijkfood-api:latest", 
                     "portMappings": [{"containerPort": API_PORT, "hostPort": API_PORT, "protocol": "tcp"}],
@@ -281,12 +297,39 @@ class Arquitetura:
                 networkConfiguration={'awsvpcConfiguration': {'subnets': subnets, 'securityGroups': [self.sgs['api']], 'assignPublicIp': 'ENABLED'}},
                 loadBalancers=[{'targetGroupArn': tg_arn, 'containerName': 'dijkfood-api-container', 'containerPort': API_PORT}]
             )
-        except ClientError: pass
+            
+            print("[ECS] Configurando Auto Scaling para a API...")
+            try:
+                self.app_asg.register_scalable_target(
+                    ServiceNamespace='ecs',
+                    ResourceId=f'service/{ECS_CLUSTER_NAME}/dijkfood-api-service',
+                    ScalableDimension='ecs:service:DesiredCount',
+                    MinCapacity=2,
+                    MaxCapacity=10 
+                )
+                self.app_asg.put_scaling_policy(
+                    PolicyName='api-cpu-scaling',
+                    ServiceNamespace='ecs',
+                    ResourceId=f'service/{ECS_CLUSTER_NAME}/dijkfood-api-service',
+                    ScalableDimension='ecs:service:DesiredCount',
+                    PolicyType='TargetTrackingScaling',
+                    TargetTrackingScalingPolicyConfiguration={
+                        'TargetValue': 50.0, 
+                        'PredefinedMetricSpecification': {'PredefinedMetricType': 'ECSServiceAverageCPUUtilization'},
+                        'ScaleOutCooldown': 60,
+                        'ScaleInCooldown': 60
+                    }
+                )
+            except ClientError as e:
+                print(f"Aviso AutoScaling API: {e}")
+                
+        except ClientError as e: 
+            print(f"\n❌ [ERRO FATAL ECS] Falha ao criar a API: {e}\n")
 
         # 3. SERVIÇO DO WORKER
         try:
             worker_task = self.ecs.register_task_definition(
-                family="dijkfood-worker-task", networkMode="awsvpc", executionRoleArn=LAB_ROLE_ARN, taskRoleArn=LAB_ROLE_ARN, requiresCompatibilities=["FARGATE"], cpu="256", memory="512",
+                family="dijkfood-worker-task", networkMode="awsvpc", executionRoleArn=LAB_ROLE_ARN, taskRoleArn=LAB_ROLE_ARN, requiresCompatibilities=["FARGATE"], cpu=f"{CPU_WORKER}", memory=f"{MEMORY_WORKER}",
                 containerDefinitions=[{
                     "name": "dijkfood-worker-container", "image": "matheuspinto4/dijkfood-worker:latest",
                     "environment": [
@@ -305,7 +348,33 @@ class Arquitetura:
                 cluster=ECS_CLUSTER_NAME, serviceName="dijkfood-worker-service", taskDefinition=worker_task['taskDefinition']['taskDefinitionArn'], desiredCount=1, launchType="FARGATE",
                 networkConfiguration={'awsvpcConfiguration': {'subnets': subnets, 'securityGroups': [self.sgs['worker']], 'assignPublicIp': 'ENABLED'}}
             )
-        except ClientError: pass
+            
+            print("[ECS] Configurando Auto Scaling para o Worker...")
+            try:
+                self.app_asg.register_scalable_target(
+                    ServiceNamespace='ecs',
+                    ResourceId=f'service/{ECS_CLUSTER_NAME}/dijkfood-worker-service',
+                    ScalableDimension='ecs:service:DesiredCount',
+                    MinCapacity=2,
+                    MaxCapacity=10 
+                )
+                self.app_asg.put_scaling_policy(
+                    PolicyName='worker-cpu-scaling',
+                    ServiceNamespace='ecs',
+                    ResourceId=f'service/{ECS_CLUSTER_NAME}/dijkfood-worker-service',
+                    ScalableDimension='ecs:service:DesiredCount',
+                    PolicyType='TargetTrackingScaling',
+                    TargetTrackingScalingPolicyConfiguration={
+                        'TargetValue': 50.0, 
+                        'PredefinedMetricSpecification': {'PredefinedMetricType': 'ECSServiceAverageCPUUtilization'},
+                        'ScaleOutCooldown': 60,
+                        'ScaleInCooldown': 60
+                    }
+                )
+            except ClientError as e:
+                print(f"Aviso AutoScaling Worker: {e}")
+        except ClientError as e: 
+            print(f"\n❌ [ERRO FATAL ECS] Falha ao criar o Worker: {e}\n")
 
     def populate_s3(self):
         print(f"\n[POPULATE] Gerando grafo de '{PLACE_NAME}'...")
@@ -324,6 +393,50 @@ class Arquitetura:
         self.s3.upload_file("graph_nodes.csv", S3_BUCKET_NAME, "graph_nodes.csv")
         self.s3.upload_file("graph_edges.csv", S3_BUCKET_NAME, "graph_edges.csv")
         print(f"[POPULATE] Grafo salvo no S3!")
+
+    def destroy_ecs_only(self):
+        print("\n[DESTROY ECS] Limpando apenas os contêineres ECS e Load Balancer...")
+        
+        print("[DESTROY ECS] Apagando API...")
+        try:
+            self.ecs.update_service(cluster=ECS_CLUSTER_NAME, service="dijkfood-api-service", desiredCount=0)
+            self.ecs.delete_service(cluster=ECS_CLUSTER_NAME, service="dijkfood-api-service")
+        except ClientError: pass 
+        
+        try:
+            waiter_api = self.ecs.get_waiter('services_inactive')
+            waiter_api.wait(
+                cluster=ECS_CLUSTER_NAME, 
+                services=["dijkfood-api-service"],
+                WaiterConfig={'Delay': 15, 'MaxAttempts': 40}
+            )
+            print(" -> API desligada com sucesso!")
+        except Exception: pass
+
+        print("[DESTROY ECS] Apagando Worker...")
+        try:
+            self.ecs.update_service(cluster=ECS_CLUSTER_NAME, service="dijkfood-worker-service", desiredCount=0)
+            self.ecs.delete_service(cluster=ECS_CLUSTER_NAME, service="dijkfood-worker-service")
+        except ClientError: pass
+        
+        try:
+            waiter_worker = self.ecs.get_waiter('services_inactive')
+            waiter_worker.wait(
+                cluster=ECS_CLUSTER_NAME, 
+                services=["dijkfood-worker-service"],
+                WaiterConfig={'Delay': 15, 'MaxAttempts': 40}
+            )
+            print(" -> Worker desligado com sucesso!")
+        except Exception: pass
+
+        try:
+            alb_arn = self.elbv2.describe_load_balancers(Names=[ALB_NAME])['LoadBalancers'][0]['LoadBalancerArn']
+            self.elbv2.delete_load_balancer(LoadBalancerArn=alb_arn)
+            tg_arn = self.elbv2.describe_target_groups(Names=[TG_NAME])['TargetGroups'][0]['TargetGroupArn']
+            self.elbv2.delete_target_group(TargetGroupArn=tg_arn)
+        except ClientError: pass
+        
+        print("[DESTROY ECS] ECS limpo! O RDS e DynamoDB continuam intactos.")
 
     def destroy(self):
         print("\n[DESTROY] Iniciando limpeza...")
@@ -416,10 +529,19 @@ async def requester(queue, results):
                 elif item["method"] in ("POST", "PATCH"):
                     if item["method"] == "POST":
                         response = await client.post(item["url"], json=item["json"])
-                        if response.status_code == 200 and item["user"] == "client" and item["url"].endswith("/pedidos/"):
-                            pedido_criado = response.json()
-                            async with orders_lock:
-                                orders[pedido_criado["id_pedido"]] = {"status": "CONFIRMED"}
+                        
+                        # NOVO: Registra o id do cliente se der sucesso, ou libera se falhar
+                        if item["user"] == "client" and item["url"].endswith("/pedidos/"):
+                            if response.status_code == 200:
+                                pedido_criado = response.json()
+                                async with orders_lock:
+                                    orders[pedido_criado["id_pedido"]] = {
+                                        "status": "CONFIRMED",
+                                        "id_cliente": item["json"]["id_cliente"]
+                                    }
+                            else:
+                                async with clientes_lock:
+                                    clientes_esperando.discard(item["json"]["id_cliente"])
                     else:  
                         response = await client.patch(item["url"], json=item["json"])
                     
@@ -427,7 +549,7 @@ async def requester(queue, results):
                         await queue.put({
                             "method": "PATCH",
                             "url": item["url"],
-                            "json": {"novo_status": "IN_TRANSIT"}, 
+                            "json": {"novo_status": "IN_TRANSIT", "id_entregador": item["json"].get("id_entregador")}, 
                             "ritmo_idx": item["ritmo_idx"],
                             "user": "courier"
                         })
@@ -442,6 +564,11 @@ async def requester(queue, results):
                 })
 
             except Exception as e:
+                # NOVO: Libera o cliente caso o POST do pedido falhe por erro de rede
+                if item["method"] == "POST" and item["user"] == "client" and item["url"].endswith("/pedidos/"):
+                    async with clientes_lock:
+                        clientes_esperando.discard(item["json"]["id_cliente"])
+                        
                 latency = time.perf_counter() - start
                 results.append({
                     "status": "error",
@@ -494,6 +621,10 @@ async def move_courier(id_entregador):
     def compute_new_desl(entregador):
         edge_idx = entregador["edge_idx"]
         rota_atual = entregador["rota_atual"]
+        
+        if not entregador[rota_atual]:
+            return 0
+            
         if edge_idx >= len(entregador[rota_atual]): return 1
         
         coord_atual, coord_nova, metros = entregador[rota_atual][edge_idx]
@@ -531,8 +662,12 @@ async def move_courier(id_entregador):
         rota_atual = entregador["rota_atual"]
         if rota_atual == "rota_restaurante":
             id_pedido = int(entregador["id_pedido"])
+            
             async with orders_lock:
+                if id_pedido not in orders:
+                    return lat, long, None 
                 status = orders[id_pedido]["status"]
+                
             if status != "READY_FOR_PICKUP":
                 return lat, long, None
             
@@ -557,10 +692,10 @@ async def updater_courier(queue, volume, duracao, ritmo_idx):
         entregador_dict["rota_cliente"] = None
         entregador_dict["rota_atual"] = None
         entregador_dict["deslocamento_atual"] = None
+        return entregador_dict 
         
     start = time.perf_counter()
     current_100ms = 0.0
-    volume *= 3
     
     while time.perf_counter() - start < duracao:
         try:
@@ -572,59 +707,34 @@ async def updater_courier(queue, volume, duracao, ritmo_idx):
                 await asyncio.sleep(0.01)
                 continue
 
-            times = []
-            while len(times) < volume:
-                delta = random.expovariate(volume)
-                if delta >= 1: continue
-                times.append(delta)
-            times = sorted(times)
-            
-            for id_entregador, each_time in zip(list(couriers.keys()), times):
+            for id_entregador in list(couriers.keys()):
                 lat, long, mudanca_rota = await move_courier(id_entregador)
                 id_pedido = int(couriers[id_entregador]["id_pedido"])
                 
                 if not lat or not long: 
-                    await queue.put({
-                        "method": "POST",
-                        "url": f"{GLOBAL_API_URL}/alocacoes/{id_entregador}/desativar/{id_pedido}",
-                        "json": {}, 
-                        "ritmo_idx": ritmo_idx,
-                        "user": "courier"
-                    })
-                    await queue.put({
-                        "method": "PATCH",
-                        "url": f"{GLOBAL_API_URL}/pedidos/{id_pedido}/status",
-                        "json": {"novo_status": "DELIVERED"}, 
-                        "ritmo_idx": ritmo_idx,
-                        "user": "courier"
-                    })
+                    await queue.put({"method": "POST", "url": f"{GLOBAL_API_URL}/alocacoes/{id_entregador}/desativar/{id_pedido}", "json": {}, "ritmo_idx": ritmo_idx, "user": "courier"})
+                    await queue.put({"method": "PATCH", "url": f"{GLOBAL_API_URL}/pedidos/{id_pedido}/status", "json": {"novo_status": "DELIVERED", "id_entregador": id_entregador}, "ritmo_idx": ritmo_idx, "user": "courier"})
+                    
                     async with orders_lock:
-                        if id_pedido in orders:
+                        if id_pedido in orders: 
+                            # NOVO: Descobre quem era o cliente e risca o nome dele da lista de espera
+                            id_cli_do_pedido = orders[id_pedido].get("id_cliente")
                             del orders[id_pedido]
+                            if id_cli_do_pedido:
+                                async with clientes_lock:
+                                    clientes_esperando.discard(id_cli_do_pedido)
+
                     async with entregadores_ocupados_lock:
                         entregador_dict = entregadores_ocupados[id_entregador]
                         del entregadores_ocupados[id_entregador]
                     async with entregadores_desocupados_lock:
                         entregadores_desocupados[id_entregador] = desalloc_courier(entregador_dict)
                 else:
-                    json = {"latitude": lat, "longitude": long}
-                    await queue.put({
-                        "method": "POST",
-                        "url": f"{GLOBAL_API_URL}/entregadores/{id_entregador}/posicao",
-                        "json": json, 
-                        "ritmo_idx": ritmo_idx,
-                        "user": "courier"
-                    })
+                    json_data = {"latitude": lat, "longitude": long}
+                    await queue.put({"method": "POST", "url": f"{GLOBAL_API_URL}/entregadores/{id_entregador}/posicao", "json": json_data, "ritmo_idx": ritmo_idx, "user": "courier"})
+                        
                     if mudanca_rota:
-                        await queue.put({
-                            "method": "PATCH",
-                            "url": f"{GLOBAL_API_URL}/pedidos/{id_pedido}/status",
-                            "json": {"novo_status": "PICKED_UP"}, 
-                            "ritmo_idx": ritmo_idx,
-                            "user": "courier"
-                        })
-                delta = start + current_100ms + each_time - time.perf_counter()
-                await asyncio.sleep(max(delta, 0))
+                        await queue.put({"method": "PATCH", "url": f"{GLOBAL_API_URL}/pedidos/{id_pedido}/status", "json": {"novo_status": "PICKED_UP", "id_entregador": id_entregador}, "ritmo_idx": ritmo_idx, "user": "courier"})
 
         except Exception as e:
             print(f"\n[ERRO CRÍTICO NO SIMULADOR] O entregador travou: {e}")
@@ -678,7 +788,20 @@ async def producer_order(queue, volume, duracao, ritmo_idx, clientes, restaurant
         current_start = time.perf_counter()
         delta = random.expovariate(volume)
 
-        id_cli = random.choice(clientes)
+        # NOVO: Separa quem pode pedir (quem não está no caderninho)
+        async with clientes_lock:
+            livres = list(set(clientes) - clientes_esperando)
+        
+        if not livres:
+            await asyncio.sleep(0.01)
+            continue
+
+        id_cli = random.choice(livres)
+        
+        # Anota o nome dele antes de disparar na API
+        async with clientes_lock:
+            clientes_esperando.add(id_cli)
+
         id_res = random.choice(restaurantes)
         json_data = {"id_cliente": id_cli, "id_restaurante": id_res, "lista_itens": []}
 
@@ -740,7 +863,7 @@ async def run_simulation():
     await asyncio.gather(*tasks)
     
     clientes = list(range(1, N_CLIENTES+1))
-    restaurantes = list(range(1, N_CLIENTES+1))
+    restaurantes = list(range(1, N_RESTAURANTES+1))
     
     async with entregadores_desocupados_lock:
         for id_entregador, [lat, long] in zip(
@@ -769,6 +892,7 @@ async def run_simulation():
         ritmo = RITMO_EXEC[idx]
         volume = VOLUMES[ritmo["volume"]]
         duracao = ritmo["duracao"]
+        print(f"RITMO {volume} por {duracao} segundos")
         producers = [
             asyncio.create_task(producer_order(queue, volume, duracao, idx, clientes, restaurantes)),
             asyncio.create_task(viewer_order(queue, volume, duracao, idx)),
@@ -826,7 +950,7 @@ async def run_simulation():
 def main():
     global GLOBAL_API_URL
     parser = argparse.ArgumentParser(description="Deploy Architecture & Simulator DijkFood")
-    parser.add_argument("--step", choices=["allocate", "populate", "destroy", "simulator"], help="Step to run")
+    parser.add_argument("--step", choices=["allocate", "populate", "destroy", "simulator", "redeploy_ecs"], help="Step to run")
     args = parser.parse_args()
 
     arq = Arquitetura()
@@ -837,6 +961,13 @@ def main():
         arq.populate_s3()
     elif args.step == "destroy":
         arq.destroy()
+    elif args.step == "redeploy_ecs":
+        arq.sgs, arq.vpc_id = arq.create_security_groups()
+        arq.rds_endpoint = arq.rds.describe_db_instances(DBInstanceIdentifier=DB_INSTANCE_ID)["DBInstances"][0]["Endpoint"]["Address"]
+        arq.destroy_ecs_only()
+        print("Aguardando 15s para a AWS liberar as placas de rede do ALB...")
+        time.sleep(15)
+        arq.allocate_ecs_services()
     elif args.step == "simulator":
         api_url = arq.get_api_url()
         if not api_url:

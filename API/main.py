@@ -18,11 +18,6 @@ from botocore.config import Config
 # Funções Auxiliares
 # ---------------------------------------------------------------------------
 def converter_decimals(obj):
-    """
-    O DynamoDB retorna números como tipo 'Decimal'. O FastAPI não sabe
-    converter isso para JSON nativamente (causando o Erro 500).
-    Essa função varre os dados e converte os Decimals para float.
-    """
     if isinstance(obj, list):
         return [converter_decimals(i) for i in obj]
     elif isinstance(obj, dict):
@@ -35,7 +30,7 @@ def converter_decimals(obj):
 # Configurações AWS & DynamoDB
 # ---------------------------------------------------------------------------
 DYNAMODB_REGION = os.getenv("AWS_REGION", "us-east-1")
-boto_config = Config(max_pool_connections=50) # Libera 50 conexões simultâneas
+boto_config = Config(max_pool_connections=50)
 dynamodb = boto3.resource("dynamodb", region_name=DYNAMODB_REGION, config=boto_config)
 
 NOME_TABELA_EVENTOS = os.getenv("DDB_EVENTOS", "dijkfood-historico-eventos")
@@ -47,7 +42,6 @@ tabela_telemetria = dynamodb.Table(NOME_TABELA_TELEMETRIA)
 NOME_TABELA_ALOCACOES = os.getenv("DDB_ALOCACOES", "dijkfood-alocacao-entregadores")
 tabela_alocacoes= dynamodb.Table(NOME_TABELA_ALOCACOES)
 
-# Configuração de logs para monitorar a API na nuvem (CloudWatch)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -59,7 +53,6 @@ DB_USER = os.getenv("DB_USER")
 DB_PASS = os.getenv("DB_PASS")
 DB_NAME = os.getenv("DB_NAME")
 
-# Monta a URL dinamicamente caso as variáveis do ECS estejam presentes
 DATABASE_URL = os.getenv("DATABASE_URL") or (
     f"postgresql://{DB_USER}:{DB_PASS}@{DB_HOST}:5432/{DB_NAME}" 
     if DB_HOST else None
@@ -143,6 +136,7 @@ TRANSICOES_VALIDAS = {
 
 class PedidoStatusUpdate(BaseModel):
     novo_status: StatusPedido
+    id_entregador: int | None = None  # <-- ADICIONADO PARA A API RECEBER O ID
 
 class Pedido(SQLModel, table=True):
     __tablename__ = "pedidos"
@@ -165,9 +159,12 @@ class PedidoCreate(BaseModel):
 # ---------------------------------------------------------------------------
 app = FastAPI(title="DijkFood API - Produção")
 
-# ---------------------------------------------------------------------------
-# Rotas: Clientes, Restaurantes e Entregadores
-# ---------------------------------------------------------------------------
+@app.get("/")
+def health_check():
+    """Rota exclusiva para o Health Check do Load Balancer da AWS"""
+    return {"status": "ok", "message": "API DijkFood operando normalmente!"}
+
+# Rotas de Clientes, Restaurantes, Entregadores...
 @app.get("/clientes/", response_model=list[Cliente])
 def listar_clientes(session: SessionDep, offset: int = 0, limit: int = 10):
     return session.exec(select(Cliente).offset(offset).limit(limit)).all()
@@ -182,7 +179,6 @@ def criar_cliente(cliente_in: ClienteCreate, session: SessionDep):
         return novo_cliente
     except Exception as e:
         session.rollback()
-        logger.error(f"Erro ao criar cliente: {e}")
         raise HTTPException(status_code=500, detail="Erro interno")
 
 @app.get("/restaurantes/", response_model=list[Restaurante])
@@ -199,7 +195,6 @@ def criar_restaurante(restaurante_in: RestauranteCreate, session: SessionDep):
         return novo_restaurante
     except Exception as e:
         session.rollback()
-        logger.error(f"Erro ao criar restaurante: {e}")
         raise HTTPException(status_code=500, detail="Erro interno")
 
 @app.get("/entregadores/", response_model=list[Entregador])
@@ -216,7 +211,6 @@ def criar_entregador(entregador_in: EntregadorCreate, session: SessionDep):
         return novo_entregador
     except Exception as e:
         session.rollback()
-        logger.error(f"Erro ao criar entregador: {e}")
         raise HTTPException(status_code=500, detail="Erro interno")
 
 @app.post("/entregadores/{id_entregador}/posicao")
@@ -232,12 +226,9 @@ def atualizar_posicao(id_entregador: int, posicao: PosicaoUpdate):
         )
         return {"status": "Posição recebida"}
     except Exception as e:
-        logger.error(f"Erro ao salvar telemetria: {e}")
         raise HTTPException(status_code=500, detail="Erro ao salvar posição")
 
-# ---------------------------------------------------------------------------
-# Rotas: Pedidos
-# ---------------------------------------------------------------------------
+# Rotas de Pedidos...
 @app.get("/pedidos/", response_model=list[Pedido])
 def listar_pedidos(session: SessionDep, offset: int = 0, limit: int = 10):
     return session.exec(select(Pedido).offset(offset).limit(limit)).all()
@@ -254,35 +245,31 @@ def criar_pedido(pedido_in: PedidoCreate, session: SessionDep):
     cliente = session.get(Cliente, pedido_in.id_cliente)
     restaurante = session.get(Restaurante, pedido_in.id_restaurante)
     if not cliente or not restaurante:
-        raise HTTPException(status_code=404, detail="Cliente ou Restaurante não encontrado")
+        raise HTTPException(status_code=404, detail="Cliente/Restaurante não encontrado")
 
     try:
         novo_pedido = Pedido(
             id_cliente=cliente.id_cliente,
             id_restaurante=restaurante.id_restaurante,
-            id_entregador=None,
             lista_itens=json.dumps(pedido_in.lista_itens)
         )
         session.add(novo_pedido)
         session.flush()
 
+        # Omitindo o id_entregador no DDB para evitar gravar a string "None"
         tabela_eventos.put_item(
             Item={
                 "id_pedido": str(novo_pedido.id_pedido),
                 "timestamp": datetime.utcnow().isoformat(),
                 "status": novo_pedido.status,
-                "event_id": uuid.uuid4().hex[:8],
-                "id_entregador": None
+                "event_id": uuid.uuid4().hex[:8]
             }
         )
-        
         session.commit()
         session.refresh(novo_pedido)
         return novo_pedido
-
     except Exception as e:
         session.rollback()
-        logger.error(f"Erro ao criar pedido: {e}")
         raise HTTPException(status_code=500, detail="Erro ao processar o pedido")
 
 @app.get("/pedidos/{id_pedido}/acompanhamento")
@@ -290,16 +277,14 @@ def acompanhar_pedido(id_pedido: int):
     try:
         resposta = tabela_eventos.query(
             KeyConditionExpression=Key('id_pedido').eq(str(id_pedido)),
-            ScanIndexForward=False, 
-            Limit=1
+            ScanIndexForward=False, Limit=1
         )
         itens = resposta.get('Items', [])
-    except Exception as e:
-        logger.error(f"Falha real de comunicação com DynamoDB: {e}")
-        raise HTTPException(status_code=500, detail="Erro ao conectar com o histórico de eventos.")
+    except Exception:
+        raise HTTPException(status_code=500, detail="Erro ao conectar com histórico.")
 
     if not itens:
-        raise HTTPException(status_code=404, detail="Nenhum status encontrado para este pedido.")
+        raise HTTPException(status_code=404, detail="Nenhum status encontrado.")
 
     pedido_dict = itens[0]
     status_atual = pedido_dict.get("status")
@@ -310,8 +295,7 @@ def acompanhar_pedido(id_pedido: int):
         try:
             resp_telemetria = tabela_telemetria.query(
                 KeyConditionExpression=Key('id_entregador').eq(id_entregador_str),
-                ScanIndexForward=False,
-                Limit=1 
+                ScanIndexForward=False, Limit=1 
             )
             itens_pos = resp_telemetria.get('Items', [])
             if itens_pos:
@@ -320,7 +304,7 @@ def acompanhar_pedido(id_pedido: int):
                     "longitude": float(itens_pos[0]["longitude"]),
                     "ultima_atualizacao": itens_pos[0]["timestamp"]
                 }
-        except Exception as e:
+        except Exception:
             pass
 
     return {
@@ -336,6 +320,10 @@ def atualizar_status_pedido(id_pedido: int, update_data: PedidoStatusUpdate, ses
     if not pedido:
         raise HTTPException(status_code=404, detail="Pedido não encontrado")
 
+    # MÁGICA AQUI: A API atualiza o entregador no RDS oficial
+    if update_data.id_entregador is not None:
+        pedido.id_entregador = update_data.id_entregador
+
     if update_data.novo_status not in (StatusPedido.CONFIRMED, StatusPedido.READY_FOR_PICKUP, StatusPedido.PREPARING) and pedido.id_entregador is None:
         raise HTTPException(status_code=400, detail="O pedido ainda não possui entregador.")
 
@@ -344,10 +332,7 @@ def atualizar_status_pedido(id_pedido: int, update_data: PedidoStatusUpdate, ses
     status_esperado = TRANSICOES_VALIDAS.get(status_atual)
     
     if status_esperado != novo_status:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Transição inválida. De {status_atual} deve ir para {status_esperado}"
-        )
+        raise HTTPException(status_code=400, detail=f"Transição inválida.")
 
     try:
         pedido.status = novo_status
@@ -355,21 +340,21 @@ def atualizar_status_pedido(id_pedido: int, update_data: PedidoStatusUpdate, ses
         session.commit()
         session.refresh(pedido)
 
-        tabela_eventos.put_item(
-            Item={
-                "id_pedido": str(id_pedido),
-                "timestamp": datetime.utcnow().isoformat(),
-                "status": novo_status,
-                "event_id": uuid.uuid4().hex[:8],
-                "id_entregador": str(pedido.id_entregador)
-            }
-        )
-        return pedido
+        # MÁGICA NO DYNAMO: Salva o log perfeito
+        item_ddb = {
+            "id_pedido": str(id_pedido),
+            "timestamp": datetime.utcnow().isoformat(),
+            "status": novo_status,
+            "event_id": uuid.uuid4().hex[:8]
+        }
+        if pedido.id_entregador:
+            item_ddb["id_entregador"] = str(pedido.id_entregador)
 
+        tabela_eventos.put_item(Item=item_ddb)
+        return pedido
     except Exception as e:
         session.rollback()
-        logger.error(f"Erro ao atualizar status: {e}")
-        raise HTTPException(status_code=500, detail="Erro de comunicação com banco de dados")
+        raise HTTPException(status_code=500, detail="Erro no banco de dados")
 
 @app.get("/pedidos/{id_pedido}/historico")
 def historico_pedido(id_pedido: int):
@@ -379,41 +364,33 @@ def historico_pedido(id_pedido: int):
             ScanIndexForward=True 
         )
         itens = resposta.get('Items', [])
-        
         if not itens:
-            raise HTTPException(status_code=404, detail="Nenhum histórico encontrado para este pedido.")
-            
+            raise HTTPException(status_code=404, detail="Sem histórico.")
         return itens
-    except Exception as e:
-        logger.error(f"Erro ao buscar histórico do pedido {id_pedido}: {e}")
-        raise HTTPException(status_code=500, detail="Erro ao conectar com o histórico de eventos.")
+    except Exception:
+        raise HTTPException(status_code=500, detail="Erro no DynamoDB.")
     
-
 @app.get("/alocacoes/{id_entregador}/acompanhamento")
 def consultar_alocacao(id_entregador: int): 
     try:
         resposta = tabela_alocacoes.query(
             KeyConditionExpression=Key('id_entregador').eq(str(id_entregador)),
-            ScanIndexForward=False, 
-            Limit=1
+            ScanIndexForward=False, Limit=1
         )
         itens = resposta.get('Items', [])
-    except Exception as e:
-        logger.error(f"Falha real de comunicação com DynamoDB: {e}")
-        raise HTTPException(status_code=500, detail="Erro ao conectar com o histórico de alocacoes.")
+    except Exception:
+        raise HTTPException(status_code=500, detail="Erro DynamoDB.")
 
     id_pedido_str = None
     rota_restaurante = None
     rota_cliente = None
     if itens:
         entregador_dict = itens[0]
-        # CORREÇÃO: Aceita ATIVO e ATIVA para prevenir dessincronia com o Worker
         if entregador_dict.get("status") in ["ATIVO", "ATIVA"]:
             id_pedido_str = entregador_dict.get("id_pedido")
             rota_restaurante = entregador_dict.get("rota_restaurante")
             rota_cliente = entregador_dict.get("rota_cliente")
 
-    # CORREÇÃO: Converte os dados do DynamoDB para JSON padrão e evita o Erro 500
     return {
         "id_entregador": id_entregador,
         "id_pedido": int(id_pedido_str) if id_pedido_str else None,
@@ -435,11 +412,9 @@ def desativar_alocacao(id_entregador: int, id_pedido: int):
             }
         )
         return {"status": "ok"}
-    except Exception as e:
-        logger.error(f"Erro ao desativar: {e}")
-        raise HTTPException(status_code=500, detail="Erro ao desativar a alocacao")
+    except Exception:
+        raise HTTPException(status_code=500, detail="Erro ao desativar")
 
-# Rotas Otimizadas para o Simulador (Bulk Insert)
 @app.post("/clientes/bulk")
 def criar_clientes_bulk(clientes_in: list[ClienteCreate], session: SessionDep):
     novos = [Cliente(nome=c.nome, email=c.email, telefone=c.telefone, latitude=c.latitude, longitude=c.longitude) for c in clientes_in]
