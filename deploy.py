@@ -60,16 +60,13 @@ API_PORT         = 80
 
 CPU_WORKER = 1024
 MEMORY_WORKER = 2048
-CPU_API = 1024
-MEMORY_API = 2048
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURAÇÕES DO SIMULADOR
 # ─────────────────────────────────────────────────────────────────────────────
-# MUDANÇA: Aumentado para haver tráfego de verdade com o limite de 1 pedido por cliente
-N_CLIENTES     = 20  
-N_RESTAURANTES = 20 
-N_ENTREGADORES = 20
+N_CLIENTES     =  1000
+N_RESTAURANTES = 300 
+N_ENTREGADORES = 3000
 CONCURRENCY = 200
 VELOCIDADE_KMH = 2000
 fator = 18 / (VELOCIDADE_KMH * 0.1) 
@@ -78,22 +75,22 @@ fator = 18 / (VELOCIDADE_KMH * 0.1)
 GLOBAL_API_URL = "" 
 
 VOLUMES = {
-    "OPERACAO_NORMAL": 100,
-    "PICO": 500,
-    "EVENTO_ESPECIAL": 2000
+    "OPERACAO_NORMAL": 10,
+    "PICO": 50,
+    "EVENTO_ESPECIAL": 200
 }
 RITMO_EXEC = [
     {
         "volume": "OPERACAO_NORMAL",
-        "duracao": 300 
+        "duracao": 60
     },
     {
         "volume": "PICO",
-        "duracao": 300
+        "duracao": 60
     },
     {
         "volume": "EVENTO_ESPECIAL",
-        "duracao": 300 
+        "duracao": 60 
     }
 ]
 
@@ -104,8 +101,6 @@ entregadores_desocupados = {}
 entregadores_desocupados_lock = asyncio.Lock()
 entregadores_ocupados = {}
 entregadores_ocupados_lock = asyncio.Lock()
-
-# --- NOVO: Sistema de fila de clientes ---
 clientes_esperando = set()
 clientes_lock = asyncio.Lock()
 
@@ -134,7 +129,6 @@ class Arquitetura:
         )
     
     def get_api_url(self):
-        """Busca o DNS do Load Balancer dinamicamente na AWS."""
         try:
             info = self.elbv2.describe_load_balancers(Names=[ALB_NAME])['LoadBalancers'][0]
             return f"http://{info['DNSName']}"
@@ -256,7 +250,6 @@ class Arquitetura:
         subnets = [s['SubnetId'] for s in self.ec2.describe_subnets(Filters=[{'Name': 'vpc-id', 'Values': [self.vpc_id]}])['Subnets']]
         self.ecs.create_cluster(clusterName=ECS_CLUSTER_NAME)
 
-        # 1. LOAD BALANCER
         alb_arn, alb_dns = None, None
         try:
             alb = self.elbv2.create_load_balancer(Name=ALB_NAME, Subnets=subnets, SecurityGroups=[self.sgs['alb']], Scheme='internet-facing')
@@ -281,10 +274,9 @@ class Arquitetura:
         if not any(l['Port'] == 80 for l in self.elbv2.describe_listeners(LoadBalancerArn=alb_arn)['Listeners']):
             self.elbv2.create_listener(LoadBalancerArn=alb_arn, Protocol='HTTP', Port=80, DefaultActions=[{'Type': 'forward', 'TargetGroupArn': tg_arn}])
 
-        # 2. SERVIÇO DA API
         try:
             api_task = self.ecs.register_task_definition(
-                family="dijkfood-api-task", networkMode="awsvpc", executionRoleArn=LAB_ROLE_ARN, taskRoleArn=LAB_ROLE_ARN, requiresCompatibilities=["FARGATE"], cpu=f"{CPU_API}", memory=f"{MEMORY_API}",
+                family="dijkfood-api-task", networkMode="awsvpc", executionRoleArn=LAB_ROLE_ARN, taskRoleArn=LAB_ROLE_ARN, requiresCompatibilities=["FARGATE"], cpu="1024", memory="2048",
                 containerDefinitions=[{
                     "name": "dijkfood-api-container", "image": "matheuspinto4/dijkfood-api:latest", 
                     "portMappings": [{"containerPort": API_PORT, "hostPort": API_PORT, "protocol": "tcp"}],
@@ -326,7 +318,6 @@ class Arquitetura:
         except ClientError as e: 
             print(f"\n❌ [ERRO FATAL ECS] Falha ao criar a API: {e}\n")
 
-        # 3. SERVIÇO DO WORKER
         try:
             worker_task = self.ecs.register_task_definition(
                 family="dijkfood-worker-task", networkMode="awsvpc", executionRoleArn=LAB_ROLE_ARN, taskRoleArn=LAB_ROLE_ARN, requiresCompatibilities=["FARGATE"], cpu=f"{CPU_WORKER}", memory=f"{MEMORY_WORKER}",
@@ -439,7 +430,9 @@ class Arquitetura:
         print("[DESTROY ECS] ECS limpo! O RDS e DynamoDB continuam intactos.")
 
     def destroy(self):
-        print("\n[DESTROY] Iniciando limpeza...")
+        print("\n[DESTROY] Iniciando limpeza pesada...")
+        
+        # 1. Apaga Serviços ECS
         try:
             self.ecs.update_service(cluster=ECS_CLUSTER_NAME, service="dijkfood-api-service", desiredCount=0)
             self.ecs.delete_service(cluster=ECS_CLUSTER_NAME, service="dijkfood-api-service")
@@ -447,6 +440,7 @@ class Arquitetura:
             self.ecs.delete_service(cluster=ECS_CLUSTER_NAME, service="dijkfood-worker-service")
         except ClientError: pass
 
+        # 2. Apaga Load Balancer e Target Group
         try:
             alb_arn = self.elbv2.describe_load_balancers(Names=[ALB_NAME])['LoadBalancers'][0]['LoadBalancerArn']
             self.elbv2.delete_load_balancer(LoadBalancerArn=alb_arn)
@@ -454,19 +448,24 @@ class Arquitetura:
             self.elbv2.delete_target_group(TargetGroupArn=tg_arn)
         except ClientError: pass
 
+        # 3. Apaga RDS e aguarda (Crucial para liberar o Security Group dele)
         try:
             self.rds.delete_db_instance(DBInstanceIdentifier=DB_INSTANCE_ID, SkipFinalSnapshot=True)
-            print("[DESTROY] Aguardando o RDS ser deletado (5-10 min)...")
+            print("[DESTROY] Aguardando o RDS ser deletado (Isso leva de 5 a 10 min)...")
             self.rds.get_waiter('db_instance_deleted').wait(DBInstanceIdentifier=DB_INSTANCE_ID, WaiterConfig={"Delay": 30, "MaxAttempts": 40})
         except ClientError: pass
 
-        try: self.ddb.Table(DDB_TABLE_EVENTOS).delete()
-        except ClientError: pass
-        try: self.ddb.Table(DDB_TABLE_TELEMETRIA).delete()
-        except ClientError: pass
-        try: self.ddb.Table(DDB_TABLE_ALOCACOES).delete()
+        # 4. Apaga Parameter Group do RDS
+        try:
+            self.rds.delete_db_parameter_group(DBParameterGroupName=PG_GROUP_NAME)
         except ClientError: pass
 
+        # 5. Apaga DynamoDB
+        for table in [DDB_TABLE_EVENTOS, DDB_TABLE_TELEMETRIA, DDB_TABLE_ALOCACOES]:
+            try: self.ddb.Table(table).delete()
+            except ClientError: pass
+
+        # 6. Apaga S3
         try:
             objects = self.s3.list_objects_v2(Bucket=S3_BUCKET_NAME)
             if 'Contents' in objects:
@@ -474,7 +473,34 @@ class Arquitetura:
             self.s3.delete_bucket(Bucket=S3_BUCKET_NAME)
         except ClientError: pass
 
-        print("[DESTROY] Comandos de exclusão enviados para a AWS!")
+        # 7. Apaga Cluster ECS (Só apaga se estiver vazio)
+        try:
+            self.ecs.delete_cluster(cluster=ECS_CLUSTER_NAME)
+        except ClientError: pass
+
+        # 8. Apaga Security Groups (Com loop de insistência devido ao tempo de desvinculação das placas de rede)
+        print("[DESTROY] Limpando Security Groups residuais...")
+        sgs_to_delete = ["dijkfood-rds-sg", "dijkfood-worker-sg", "dijkfood-api-sg", "dijkfood-alb-sg"]
+        
+        # Tenta apagar os SGs por até 2 minutos (AWS demora para soltar os IPs do Load Balancer)
+        for _ in range(12): 
+            sgs_pendentes = []
+            for sg_name in sgs_to_delete:
+                try:
+                    sgs = self.ec2.describe_security_groups(Filters=[{"Name": "group-name", "Values": [sg_name]}])
+                    if sgs["SecurityGroups"]:
+                        sg_id = sgs["SecurityGroups"][0]["GroupId"]
+                        self.ec2.delete_security_group(GroupId=sg_id)
+                except ClientError as e:
+                    if 'DependencyViolation' in str(e):
+                        sgs_pendentes.append(sg_name) # Ainda tem placa de rede presa nele
+            
+            sgs_to_delete = sgs_pendentes
+            if not sgs_to_delete:
+                break # Todos foram apagados com sucesso!
+            time.sleep(10)
+
+        print("[DESTROY] Nuvem limpa! Conta AWS intacta e sem recursos fantasmas.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -500,7 +526,7 @@ async def requester(queue, results):
         entregador_dict["deslocamento_atual"] = [*entregador_dict["posicao"], 0]
         return entregador_dict 
 
-    async with httpx.AsyncClient(timeout=10.0) as client:
+    async with httpx.AsyncClient(timeout=60.0) as client:
         while True:
             item = await queue.get()
             if item is None:
@@ -529,8 +555,6 @@ async def requester(queue, results):
                 elif item["method"] in ("POST", "PATCH"):
                     if item["method"] == "POST":
                         response = await client.post(item["url"], json=item["json"])
-                        
-                        # NOVO: Registra o id do cliente se der sucesso, ou libera se falhar
                         if item["user"] == "client" and item["url"].endswith("/pedidos/"):
                             if response.status_code == 200:
                                 pedido_criado = response.json()
@@ -564,7 +588,6 @@ async def requester(queue, results):
                 })
 
             except Exception as e:
-                # NOVO: Libera o cliente caso o POST do pedido falhe por erro de rede
                 if item["method"] == "POST" and item["user"] == "client" and item["url"].endswith("/pedidos/"):
                     async with clientes_lock:
                         clientes_esperando.discard(item["json"]["id_cliente"])
@@ -581,42 +604,55 @@ async def requester(queue, results):
 
             queue.task_done()
 
-async def restaurant_updater(queue, volume, duracao, ritmo_idx):
-    volume = max(volume // 6, 1)
+# MUDANÇA: A cozinha agora é um processo contínuo e independente
+async def restaurant_updater(queue, current_ritmo, duracao):
     start = time.perf_counter()
+    volume_cozinha = 20 # Ritmo fixo e rápido da cozinha para dar conta do volume
+
     while time.perf_counter() - start < duracao:
         current_start = time.perf_counter()
-        delta = random.expovariate(volume)
-        
-        status = "CONFIRMED"
-        novo_status = "PREPARING"
-        if random.random() <= 0.1:
-            status = "PREPARING"
-            novo_status = "READY_FOR_PICKUP"
-        
+        delta = random.expovariate(volume_cozinha)
+        ritmo_idx = current_ritmo[0]
+
         try:
             async with orders_lock:
                 current_orders = dict(orders)
-            id_pedido = next(pedido_num for pedido_num, pedido in current_orders.items() if pedido["status"] == status)
-        except Exception as e:
+
+            preparando = [id_p for id_p, p in current_orders.items() if p["status"] == "PREPARING"]
+            confirmados = [id_p for id_p, p in current_orders.items() if p["status"] == "CONFIRMED"]
+
+            id_pedido = None
+            novo_status = None
+
+            # Fast-Food Logic para evitar o travamento da fila
+            if preparando and (random.random() <= 0.8 or not confirmados):
+                id_pedido = random.choice(preparando)
+                novo_status = "READY_FOR_PICKUP"
+            elif confirmados:
+                id_pedido = random.choice(confirmados)
+                novo_status = "PREPARING"
+
+            if id_pedido and novo_status:
+                await queue.put({
+                    "method": "PATCH",
+                    "url": f"{GLOBAL_API_URL}/pedidos/{id_pedido}/status",
+                    "json": {"novo_status": novo_status},
+                    "ritmo_idx": ritmo_idx,
+                    "user": "restaurant"
+                })
+                async with orders_lock:
+                    orders[id_pedido]["status"] = novo_status
+
+        except Exception:
             await asyncio.sleep(0.01)
             continue
-        
-        await queue.put({
-            "method": "PATCH",
-            "url": f"{GLOBAL_API_URL}/pedidos/{id_pedido}/status",
-            "json": {"novo_status": novo_status}, 
-            "ritmo_idx": ritmo_idx,
-            "user": "restaurant"
-        })
-        async with orders_lock:
-            orders[id_pedido]["status"] = novo_status
-            
+
         delta_sleep = current_start + delta - time.perf_counter()
         await asyncio.sleep(max(delta_sleep, 0))
 
 async def move_courier(id_entregador):
     fim_rota = False 
+    mudanca_rota = False
     
     def compute_new_desl(entregador):
         edge_idx = entregador["edge_idx"]
@@ -684,7 +720,8 @@ async def move_courier(id_entregador):
 
     return entregador["posicao"][0], entregador["posicao"][1], mudanca_rota
 
-async def updater_courier(queue, volume, duracao, ritmo_idx):
+# MUDANÇA: O entregador agora é um processo contínuo e independente
+async def updater_courier(queue, current_ritmo, duracao):
     def desalloc_courier(entregador_dict):
         entregador_dict["id_pedido"] = None
         entregador_dict["edge_idx"] = None
@@ -699,46 +736,44 @@ async def updater_courier(queue, volume, duracao, ritmo_idx):
     
     while time.perf_counter() - start < duracao:
         try:
+            ritmo_idx = current_ritmo[0]
             couriers = None
             async with entregadores_ocupados_lock:
                 couriers = dict(entregadores_ocupados)
             
-            if not couriers:
-                await asyncio.sleep(0.01)
-                continue
-
-            for id_entregador in list(couriers.keys()):
-                lat, long, mudanca_rota = await move_courier(id_entregador)
-                id_pedido = int(couriers[id_entregador]["id_pedido"])
-                
-                if not lat or not long: 
-                    await queue.put({"method": "POST", "url": f"{GLOBAL_API_URL}/alocacoes/{id_entregador}/desativar/{id_pedido}", "json": {}, "ritmo_idx": ritmo_idx, "user": "courier"})
-                    await queue.put({"method": "PATCH", "url": f"{GLOBAL_API_URL}/pedidos/{id_pedido}/status", "json": {"novo_status": "DELIVERED", "id_entregador": id_entregador}, "ritmo_idx": ritmo_idx, "user": "courier"})
+            if couriers:
+                for id_entregador in list(couriers.keys()):
+                    lat, long, mudanca_rota = await move_courier(id_entregador)
+                    id_pedido = int(couriers[id_entregador]["id_pedido"])
                     
-                    async with orders_lock:
-                        if id_pedido in orders: 
-                            # NOVO: Descobre quem era o cliente e risca o nome dele da lista de espera
-                            id_cli_do_pedido = orders[id_pedido].get("id_cliente")
-                            del orders[id_pedido]
-                            if id_cli_do_pedido:
-                                async with clientes_lock:
-                                    clientes_esperando.discard(id_cli_do_pedido)
-
-                    async with entregadores_ocupados_lock:
-                        entregador_dict = entregadores_ocupados[id_entregador]
-                        del entregadores_ocupados[id_entregador]
-                    async with entregadores_desocupados_lock:
-                        entregadores_desocupados[id_entregador] = desalloc_courier(entregador_dict)
-                else:
-                    json_data = {"latitude": lat, "longitude": long}
-                    await queue.put({"method": "POST", "url": f"{GLOBAL_API_URL}/entregadores/{id_entregador}/posicao", "json": json_data, "ritmo_idx": ritmo_idx, "user": "courier"})
+                    if not lat or not long: 
+                        await queue.put({"method": "POST", "url": f"{GLOBAL_API_URL}/alocacoes/{id_entregador}/desativar/{id_pedido}", "json": {}, "ritmo_idx": ritmo_idx, "user": "courier"})
+                        await queue.put({"method": "PATCH", "url": f"{GLOBAL_API_URL}/pedidos/{id_pedido}/status", "json": {"novo_status": "DELIVERED", "id_entregador": id_entregador}, "ritmo_idx": ritmo_idx, "user": "courier"})
                         
-                    if mudanca_rota:
-                        await queue.put({"method": "PATCH", "url": f"{GLOBAL_API_URL}/pedidos/{id_pedido}/status", "json": {"novo_status": "PICKED_UP", "id_entregador": id_entregador}, "ritmo_idx": ritmo_idx, "user": "courier"})
+                        async with orders_lock:
+                            if id_pedido in orders: 
+                                id_cli_do_pedido = orders[id_pedido].get("id_cliente")
+                                del orders[id_pedido]
+                                if id_cli_do_pedido:
+                                    async with clientes_lock:
+                                        clientes_esperando.discard(id_cli_do_pedido)
+
+                        async with entregadores_ocupados_lock:
+                            entregador_dict = entregadores_ocupados[id_entregador]
+                            del entregadores_ocupados[id_entregador]
+                        async with entregadores_desocupados_lock:
+                            entregadores_desocupados[id_entregador] = desalloc_courier(entregador_dict)
+                    else:
+                        json_data = {"latitude": lat, "longitude": long}
+                        await queue.put({"method": "POST", "url": f"{GLOBAL_API_URL}/entregadores/{id_entregador}/posicao", "json": json_data, "ritmo_idx": ritmo_idx, "user": "courier"})
+                            
+                        if mudanca_rota:
+                            await queue.put({"method": "PATCH", "url": f"{GLOBAL_API_URL}/pedidos/{id_pedido}/status", "json": {"novo_status": "PICKED_UP", "id_entregador": id_entregador}, "ritmo_idx": ritmo_idx, "user": "courier"})
 
         except Exception as e:
             print(f"\n[ERRO CRÍTICO NO SIMULADOR] O entregador travou: {e}")
 
+        # O motor bate exatamente a cada 0.1s de forma contínua
         current_100ms += 0.1
         delta = start + current_100ms - time.perf_counter()
         await asyncio.sleep(max(delta, 0))
@@ -788,7 +823,6 @@ async def producer_order(queue, volume, duracao, ritmo_idx, clientes, restaurant
         current_start = time.perf_counter()
         delta = random.expovariate(volume)
 
-        # NOVO: Separa quem pode pedir (quem não está no caderninho)
         async with clientes_lock:
             livres = list(set(clientes) - clientes_esperando)
         
@@ -798,7 +832,6 @@ async def producer_order(queue, volume, duracao, ritmo_idx, clientes, restaurant
 
         id_cli = random.choice(livres)
         
-        # Anota o nome dele antes de disparar na API
         async with clientes_lock:
             clientes_esperando.add(id_cli)
 
@@ -888,22 +921,56 @@ async def run_simulation():
         for _ in range(CONCURRENCY)
     ]
 
+    # --- NOVA ARQUITETURA DE SIMULAÇÃO CONTÍNUA ---
+    total_duracao = sum(r["duracao"] for r in RITMO_EXEC)
+    current_ritmo = [0] # Compartilha a fase atual com os motores de física
+
+    # 1. Os "Motores de Física" ligam agora e nunca mais param até o fim da simulação
+    motores_background = [
+        asyncio.create_task(updater_courier(queue, current_ritmo, total_duracao)),
+        asyncio.create_task(restaurant_updater(queue, current_ritmo, total_duracao))
+    ]
+
     for idx in range(len(RITMO_EXEC)):
         ritmo = RITMO_EXEC[idx]
         volume = VOLUMES[ritmo["volume"]]
         duracao = ritmo["duracao"]
-        print(f"RITMO {volume} por {duracao} segundos")
+        current_ritmo[0] = idx # Avisa os motores em qual fase estamos para os logs
+        print(f"RITMO {ritmo['volume']} por {duracao} segundos")
+
+        # 2. Os "Spawners" (Geradores) obedecem as fases. Param e reiniciam.
         producers = [
             asyncio.create_task(producer_order(queue, volume, duracao, idx, clientes, restaurantes)),
             asyncio.create_task(viewer_order(queue, volume, duracao, idx)),
-            asyncio.create_task(updater_courier(queue, volume, duracao, idx)),
             asyncio.create_task(viewer_courier(queue, volume, duracao, idx)),
-            asyncio.create_task(restaurant_updater(queue, volume, duracao, idx))
         ]
 
+        # REMOVIDO o queue.join() daqui. A transição para o próximo ritmo agora é instantânea!
         await asyncio.gather(*producers)
-        await queue.join()
+
+    # 3. Fim de todas as fases. Espera a esteira esvaziar os últimos pedidos pendentes.
+    # REMOVIDO o queue.join() daqui. A transição para o próximo ritmo agora é instantânea!
+        await asyncio.gather(*producers)
+
+    # 3. Fim de todas as fases. Aguarda os motores de background pararem.
+    await asyncio.gather(*motores_background)
+
+    # 4. Feedback visual de Drenagem da Fila (O Fim da Ilusão do Travamento)
+    itens_restantes = queue.qsize()
+    if itens_restantes > 0:
+        print(f"\n[Aguardando a AWS] O tempo de simulação ({total_duracao}s) acabou!")
+        print(f"Devido ao tráfego pesado, {itens_restantes} requisições acumularam na esteira do Python.")
+        print("Drenando as requisições restantes para a nuvem para não corromper os logs...")
         
+        # Loop que atualiza a mesma linha do terminal enquanto a fila esvazia
+        while not queue.empty():
+            print(f"⏳ Faltam processar: {queue.qsize()} requisições...    ", end="\r")
+            await asyncio.sleep(0.5)
+            
+    await queue.join()
+    print("\n✅ Todas as requisições foram processadas e respondidas pela API da AWS!")
+
+    # 5. Desliga os garçons (requesters)
     for _ in requesters:
         await queue.put(None)
 

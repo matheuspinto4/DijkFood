@@ -169,6 +169,22 @@ def health_check():
 def listar_clientes(session: SessionDep, offset: int = 0, limit: int = 10):
     return session.exec(select(Cliente).offset(offset).limit(limit)).all()
 
+@app.get("/clientes/{id_cliente}/pedidos", response_model=list[Pedido])
+def historico_pedidos_cliente(id_cliente: int, session: SessionDep):
+    """Retorna o histórico de pedidos de um cliente em ordem cronológica (Requisito do trabalho)"""
+    cliente = session.get(Cliente, id_cliente)
+    if not cliente:
+        raise HTTPException(status_code=404, detail="Cliente não encontrado")
+        
+    # Busca pedidos do cliente ordenados pela PK (que equivale a ordem cronológica de criação)
+    pedidos = session.exec(
+        select(Pedido)
+        .where(Pedido.id_cliente == id_cliente)
+        .order_by(Pedido.id_pedido.asc())
+    ).all()
+    
+    return pedidos
+
 @app.post("/clientes/", response_model=Cliente)
 def criar_cliente(cliente_in: ClienteCreate, session: SessionDep):
     try:
@@ -399,7 +415,7 @@ def consultar_alocacao(id_entregador: int):
     }
     
 @app.post("/alocacoes/{id_entregador}/desativar/{id_pedido}")
-def desativar_alocacao(id_entregador: int, id_pedido: int):
+def desativar_alocacao(id_entregador: int, id_pedido: int, session: SessionDep):
     try:
         tabela_alocacoes.put_item(
             Item={
@@ -411,9 +427,26 @@ def desativar_alocacao(id_entregador: int, id_pedido: int):
                 "rota_cliente": None
             }
         )
+        
+        entregador = session.get(Entregador, id_entregador)
+        pedido = session.get(Pedido, id_pedido)
+        
+        if entregador and pedido:
+            cliente = session.get(Cliente, pedido.id_cliente)
+            
+            entregador.status = "AVAILABLE"
+            if cliente: # O entregador passa a esperar no local da última entrega
+                entregador.latitude = cliente.latitude
+                entregador.longitude = cliente.longitude
+                
+            session.add(entregador)
+            session.commit()
+
         return {"status": "ok"}
-    except Exception:
-        raise HTTPException(status_code=500, detail="Erro ao desativar")
+    except Exception as e:
+        session.rollback()
+        logger.error(f"Erro ao desativar: {e}")
+        raise HTTPException(status_code=500, detail="Erro ao desativar a alocacao")
 
 @app.post("/clientes/bulk")
 def criar_clientes_bulk(clientes_in: list[ClienteCreate], session: SessionDep):
