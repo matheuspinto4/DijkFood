@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 import contextily as ctx
 
 # --- CONFIGURAÇÕES ---
-API_URL = "http://dijkfood-api-alb-611216641.us-east-1.elb.amazonaws.com"
+API_URL = "http://dijkfood-api-alb-1177915461.us-east-1.elb.amazonaws.com"
 TAXA_ATUALIZACAO_SEGUNDOS = 1
 
 def haversine(lat1, lon1, lat2, lon2):
