@@ -3,10 +3,10 @@ deploy.py — Full Architecture Deployment & Traffic Simulator
 Criado para o projeto DijkFood
 
 Lifecycle:
-  1. allocate   — Cria toda a infraestrutura e as tabelas vazias no Banco de Dados
-  2. populate   — Baixa o Grafo Viário (OSMnx) e envia para o S3
-  3. destroy    — Apaga rigorosamente TODOS os recursos
-  4. simulator  — Roda a simulação de tráfego usando a URL dinâmica do ALB
+  1. allocate   — Cria toda a infraestrutura e as tabelas vazias no Banco de Dados.
+  2. populate   — Baixa o Grafo Viário (OSMnx) da cidade e envia para o S3.
+  3. destroy    — Apaga rigorosamente TODOS os recursos provisionados na AWS.
+  4. simulator  — Roda a simulação de tráfego assíncrona usando a URL dinâmica do ALB.
 """
 
 import argparse
@@ -28,6 +28,8 @@ from fake_data import gerar_dados_falsos
 # CONFIGURAÇÕES DA INFRAESTRUTURA
 # ─────────────────────────────────────────────────────────────────────────────
 REGION         = "us-east-1"
+
+# Tenta obter o ID da conta AWS atual e a Role do laboratório (ex: AWS Academy)
 try:
     ACCOUNT_ID = boto3.client('sts').get_caller_identity().get('Account')
     LAB_ROLE_ARN = f"arn:aws:iam::{ACCOUNT_ID}:role/LabRole"
@@ -35,20 +37,18 @@ except Exception:
     ACCOUNT_ID = "000000000000"
     LAB_ROLE_ARN = ""
 
+# Configurações de capacidade do ECS Fargate para o Worker
 CPU_WORKER = 1024
 MEMORY_WORKER = 2048
 MIN_INSTANCES_WORKER = 2
-MAX_INSTANCES_WORKER = 30
+MAX_INSTANCES_WORKER =30
 
+# Configurações de capacidade do ECS Fargate para a API
 MIN_INSTANCES_API = 2
 MAX_INSTANCES_API = 30
 
-# CPU_WORKER = 512
-# MEMORY_WORKER = 1024
-
+# Configurações do Banco de Dados Relacional (RDS PostgreSQL)
 RDS_INSTANCE_CLASS = "db.t3.micro"
-# RDS_INSTANCE_CLASS = "db.t3.medium"
-
 DB_INSTANCE_ID = "dijkfood-primary"
 DB_NAME        = "dijkfooddb"
 DB_ADMIN_USER  = "dijk_admin"
@@ -58,19 +58,21 @@ INSTANCE_CLASS = RDS_INSTANCE_CLASS
 PG_VERSION     = "16"
 PG_GROUP_NAME  = "dijkfood-pg16"   
 
+# Nomes das tabelas NoSQL no DynamoDB
 DDB_TABLE_EVENTOS    = "dijkfood-historico-eventos"
 DDB_TABLE_TELEMETRIA = "dijkfood-telemetria-entregadores"
-DDB_TABLE_ALOCACOES = "dijkfood-alocacao-entregadores"
+DDB_TABLE_ALOCACOES  = "dijkfood-alocacao-entregadores"
 
+# Configurações do S3 e OSMnx (Grafo Viário)
 S3_BUCKET_NAME = f"dijkfood-grafo-sp-{ACCOUNT_ID}"
 PLACE_NAME     = "São Paulo, Brazil"
 NETWORK_TYPE   = "drive"
 
+# Configurações do Cluster e Load Balancer
 ECS_CLUSTER_NAME = "DijkFoodCluster"
 ALB_NAME         = "dijkfood-api-alb"
 TG_NAME          = "dijkfood-api-tg"
 API_PORT         = 80 
-
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -79,18 +81,20 @@ API_PORT         = 80
 N_CLIENTES     =  1000
 N_RESTAURANTES = 300 
 N_ENTREGADORES = 3000
-CONCURRENCY = 200
+CONCURRENCY    = 200
 VELOCIDADE_KMH = 2000
 fator = 18 / (VELOCIDADE_KMH * 0.1) 
 
-
 GLOBAL_API_URL = "" 
 
+# Definição dos cenários de volume de requisições
 VOLUMES = {
     "OPERACAO_NORMAL": 10,
     "PICO": 50,
     "EVENTO_ESPECIAL": 200
 }
+
+# Cronograma de execução da simulação (fases)
 RITMO_EXEC = [
     {
         "volume": "OPERACAO_NORMAL",
@@ -106,7 +110,7 @@ RITMO_EXEC = [
     }
 ]
 
-# Travas Assíncronas (Locks) do Simulador
+# Travas Assíncronas (Locks) para concorrência segura no Simulador
 orders = {}
 orders_lock = asyncio.Lock()
 entregadores_desocupados = {}
@@ -121,7 +125,13 @@ clientes_lock = asyncio.Lock()
 # MÓDULO DE ARQUITETURA
 # ─────────────────────────────────────────────────────────────────────────────
 class Arquitetura:
+    """
+    Classe responsável por provisionar, configurar e destruir a infraestrutura
+    na AWS, incluindo VPC, Security Groups, RDS, DynamoDB, S3, ECS e Load Balancer.
+    """
+    
     def __init__(self):
+        """Inicializa os clientes AWS e variáveis de estado da infraestrutura."""
         self.rds, self.ec2, self.ddb, self.s3, self.ecs, self.elbv2, self.app_asg = self.get_clients()
         self.sgs = {}
         self.vpc_id = None
@@ -129,6 +139,7 @@ class Arquitetura:
         self.rds_endpoint = None
 
     def get_clients(self):
+        """Instancia e retorna os clients do boto3 necessários para a arquitetura."""
         session = boto3.Session(region_name=REGION)
         return (
             session.client("rds"), 
@@ -141,6 +152,12 @@ class Arquitetura:
         )
     
     def get_api_url(self):
+        """
+        Recupera o DNS do Load Balancer (ALB) criado para acesso à API.
+        
+        Returns:
+            str ou None: URL base da API se encontrada, senão None.
+        """
         try:
             info = self.elbv2.describe_load_balancers(Names=[ALB_NAME])['LoadBalancers'][0]
             return f"http://{info['DNSName']}"
@@ -149,6 +166,7 @@ class Arquitetura:
             return None
 
     def allocate(self):
+        """Orquestra a criação sequencial de toda a infraestrutura requerida."""
         self.sgs, self.vpc_id = self.create_security_groups()
         self.pg_group = self.create_parameter_group()
         self.allocate_rds()
@@ -158,6 +176,12 @@ class Arquitetura:
         self.create_rds_schema()
 
     def create_security_groups(self):
+        """
+        Cria e configura as regras de entrada (Ingress) dos Security Groups.
+        
+        Returns:
+            tuple: Um dicionário de IDs de Security Groups e o ID da VPC padrão.
+        """
         vpcs = self.ec2.describe_vpcs(Filters=[{"Name": "isDefault", "Values": ["true"]}])
         if not vpcs["Vpcs"]: raise RuntimeError("No default VPC found.")
         vpc_id = vpcs["Vpcs"][0]["VpcId"]
@@ -180,6 +204,7 @@ class Arquitetura:
         sgs['worker'] = get_or_create_sg("dijkfood-worker-sg", "SG para ECS Worker")
         sgs['rds'] = get_or_create_sg("dijkfood-rds-sg", "SG para RDS")
     
+        # Regras de firewall
         try: self.ec2.authorize_security_group_ingress(GroupId=sgs['alb'], IpPermissions=[{"IpProtocol": "tcp", "FromPort": 80, "ToPort": 80, "IpRanges": [{"CidrIp": "0.0.0.0/0"}]}])
         except ClientError: pass
         try: self.ec2.authorize_security_group_ingress(GroupId=sgs['api'], IpPermissions=[{"IpProtocol": "tcp", "FromPort": API_PORT, "ToPort": API_PORT, "UserIdGroupPairs": [{"GroupId": sgs['alb']}]}])
@@ -195,12 +220,14 @@ class Arquitetura:
         return sgs, vpc_id
     
     def create_parameter_group(self):
+        """Cria o parameter group customizado para o RDS PostgreSQL."""
         try:
             self.rds.create_db_parameter_group(DBParameterGroupName=PG_GROUP_NAME, DBParameterGroupFamily=f"postgres{PG_VERSION}", Description="DijkFood parameter group")
         except ClientError: pass
         return PG_GROUP_NAME
 
     def allocate_rds(self):
+        """Provisiona a instância principal Multi-AZ do banco RDS (PostgreSQL)."""
         print(f"[RDS] Creating '{DB_INSTANCE_ID}' Multi-AZ ...")
         try:
             self.rds.create_db_instance(
@@ -218,6 +245,7 @@ class Arquitetura:
         print(f"[RDS] Endpoint: {self.rds_endpoint}")
 
     def create_rds_schema(self):
+        """Conecta ao banco RDS recém-criado e cria as tabelas essenciais."""
         print(f"\n[RDS] Criando tabelas (Schema)...")
         conn = None
         for attempt in range(1, 7):
@@ -247,6 +275,7 @@ class Arquitetura:
         conn.close()
 
     def allocate_dynamodb(self):
+        """Cria as tabelas NoSQL on-demand no DynamoDB para histórico e telemetria."""
         for tb_name, pk_name in [(DDB_TABLE_EVENTOS, "id_pedido"), (DDB_TABLE_TELEMETRIA, "id_entregador"), (DDB_TABLE_ALOCACOES, "id_entregador")]:
             try:
                 table = self.ddb.create_table(TableName=tb_name, KeySchema=[{"AttributeName": pk_name, "KeyType": "HASH"}, {"AttributeName": "timestamp", "KeyType": "RANGE"}], AttributeDefinitions=[{"AttributeName": pk_name, "AttributeType": "S"}, {"AttributeName": "timestamp", "AttributeType": "S"}], BillingMode="PAY_PER_REQUEST")
@@ -254,10 +283,12 @@ class Arquitetura:
             except ClientError: pass
 
     def allocate_s3(self):
+        """Cria o bucket S3 para armazenar os arquivos do grafo viário."""
         try: self.s3.create_bucket(Bucket=S3_BUCKET_NAME)
         except ClientError: pass
 
     def allocate_ecs_services(self):
+        """Provisiona o Load Balancer, o cluster ECS Fargate, as Tasks e os Services."""
         print(f"\n--- Criando ECS e Load Balancer ---")
         subnets = [s['SubnetId'] for s in self.ec2.describe_subnets(Filters=[{'Name': 'vpc-id', 'Values': [self.vpc_id]}])['Subnets']]
         self.ecs.create_cluster(clusterName=ECS_CLUSTER_NAME)
@@ -286,6 +317,7 @@ class Arquitetura:
         if not any(l['Port'] == 80 for l in self.elbv2.describe_listeners(LoadBalancerArn=alb_arn)['Listeners']):
             self.elbv2.create_listener(LoadBalancerArn=alb_arn, Protocol='HTTP', Port=80, DefaultActions=[{'Type': 'forward', 'TargetGroupArn': tg_arn}])
 
+        # Definição e criação do Serviço da API
         try:
             api_task = self.ecs.register_task_definition(
                 family="dijkfood-api-task", networkMode="awsvpc", executionRoleArn=LAB_ROLE_ARN, taskRoleArn=LAB_ROLE_ARN, requiresCompatibilities=["FARGATE"], cpu="1024", memory="2048",
@@ -330,6 +362,7 @@ class Arquitetura:
         except ClientError as e: 
             print(f"\n❌ [ERRO FATAL ECS] Falha ao criar a API: {e}\n")
 
+        # Definição e criação do Serviço do Worker
         try:
             worker_task = self.ecs.register_task_definition(
                 family="dijkfood-worker-task", networkMode="awsvpc", executionRoleArn=LAB_ROLE_ARN, taskRoleArn=LAB_ROLE_ARN, requiresCompatibilities=["FARGATE"], cpu=f"{CPU_WORKER}", memory=f"{MEMORY_WORKER}",
@@ -380,6 +413,7 @@ class Arquitetura:
             print(f"\n❌ [ERRO FATAL ECS] Falha ao criar o Worker: {e}\n")
 
     def populate_s3(self):
+        """Usa a biblioteca OSMnx para baixar dados geográficos de ruas e faz o upload para o S3."""
         print(f"\n[POPULATE] Gerando grafo de '{PLACE_NAME}'...")
         G = ox.graph_from_place(PLACE_NAME, network_type=NETWORK_TYPE)
         
@@ -398,6 +432,7 @@ class Arquitetura:
         print(f"[POPULATE] Grafo salvo no S3!")
 
     def destroy_ecs_only(self):
+        """Zera as contagens desejadas e deleta os serviços ECS e Load Balancer (Soft Clean)."""
         print("\n[DESTROY ECS] Limpando apenas os contêineres ECS e Load Balancer...")
         
         print("[DESTROY ECS] Apagando API...")
@@ -442,9 +477,9 @@ class Arquitetura:
         print("[DESTROY ECS] ECS limpo! O RDS e DynamoDB continuam intactos.")
 
     def destroy(self):
+        """Exclui sistematicamente TODOS os recursos provisionados na nuvem para evitar custos."""
         print("\n[DESTROY] Iniciando limpeza pesada...")
         
-        # 1. Apaga Serviços ECS
         try:
             self.ecs.update_service(cluster=ECS_CLUSTER_NAME, service="dijkfood-api-service", desiredCount=0)
             self.ecs.delete_service(cluster=ECS_CLUSTER_NAME, service="dijkfood-api-service")
@@ -452,7 +487,6 @@ class Arquitetura:
             self.ecs.delete_service(cluster=ECS_CLUSTER_NAME, service="dijkfood-worker-service")
         except ClientError: pass
 
-        # 2. Apaga Load Balancer e Target Group
         try:
             alb_arn = self.elbv2.describe_load_balancers(Names=[ALB_NAME])['LoadBalancers'][0]['LoadBalancerArn']
             self.elbv2.delete_load_balancer(LoadBalancerArn=alb_arn)
@@ -460,24 +494,20 @@ class Arquitetura:
             self.elbv2.delete_target_group(TargetGroupArn=tg_arn)
         except ClientError: pass
 
-        # 3. Apaga RDS e aguarda (Crucial para liberar o Security Group dele)
         try:
             self.rds.delete_db_instance(DBInstanceIdentifier=DB_INSTANCE_ID, SkipFinalSnapshot=True)
             print("[DESTROY] Aguardando o RDS ser deletado (Isso leva de 5 a 10 min)...")
             self.rds.get_waiter('db_instance_deleted').wait(DBInstanceIdentifier=DB_INSTANCE_ID, WaiterConfig={"Delay": 30, "MaxAttempts": 40})
         except ClientError: pass
 
-        # 4. Apaga Parameter Group do RDS
         try:
             self.rds.delete_db_parameter_group(DBParameterGroupName=PG_GROUP_NAME)
         except ClientError: pass
 
-        # 5. Apaga DynamoDB
         for table in [DDB_TABLE_EVENTOS, DDB_TABLE_TELEMETRIA, DDB_TABLE_ALOCACOES]:
             try: self.ddb.Table(table).delete()
             except ClientError: pass
 
-        # 6. Apaga S3
         try:
             objects = self.s3.list_objects_v2(Bucket=S3_BUCKET_NAME)
             if 'Contents' in objects:
@@ -485,16 +515,13 @@ class Arquitetura:
             self.s3.delete_bucket(Bucket=S3_BUCKET_NAME)
         except ClientError: pass
 
-        # 7. Apaga Cluster ECS (Só apaga se estiver vazio)
         try:
             self.ecs.delete_cluster(cluster=ECS_CLUSTER_NAME)
         except ClientError: pass
 
-        # 8. Apaga Security Groups (Com loop de insistência devido ao tempo de desvinculação das placas de rede)
         print("[DESTROY] Limpando Security Groups residuais...")
         sgs_to_delete = ["dijkfood-rds-sg", "dijkfood-worker-sg", "dijkfood-api-sg", "dijkfood-alb-sg"]
         
-        # Tenta apagar os SGs por até 2 minutos (AWS demora para soltar os IPs do Load Balancer)
         for _ in range(12): 
             sgs_pendentes = []
             for sg_name in sgs_to_delete:
@@ -505,11 +532,11 @@ class Arquitetura:
                         self.ec2.delete_security_group(GroupId=sg_id)
                 except ClientError as e:
                     if 'DependencyViolation' in str(e):
-                        sgs_pendentes.append(sg_name) # Ainda tem placa de rede presa nele
+                        sgs_pendentes.append(sg_name) 
             
             sgs_to_delete = sgs_pendentes
             if not sgs_to_delete:
-                break # Todos foram apagados com sucesso!
+                break 
             time.sleep(10)
 
         print("[DESTROY] Nuvem limpa! Conta AWS intacta e sem recursos fantasmas.")
@@ -519,6 +546,13 @@ class Arquitetura:
 # MÓDULO DO SIMULADOR DE TRÁFEGO
 # ─────────────────────────────────────────────────────────────────────────────
 async def preload(jsons, url):
+    """
+    Envia uma grande carga de dados iniciais via endpoint bulk para preparar o banco.
+    
+    Args:
+        jsons (list): Lista de dicionários (dados).
+        url (str): Endpoint da API que aceitará a requisição bulk.
+    """
     print(f"Enviando lote de {len(jsons)} registros para {url}bulk ...")
     async with httpx.AsyncClient(timeout=60.0) as client:
         response = await client.post(url + "bulk", json=jsons)
@@ -529,7 +563,16 @@ async def preload(jsons, url):
             raise Exception(f"Falha ao popular o banco de dados!, {url}bulk, {jsons}")
 
 async def requester(queue, results):
+    """
+    Worker que consome a fila assíncrona (queue) e executa as requisições HTTP reais.
+    Também gerencia a alocação do entregador no caso de respostas de rota recebidas.
+    
+    Args:
+        queue (asyncio.Queue): Fila de tarefas geradas pelos produtores.
+        results (list): Lista partilhada onde grava os tempos (latência) de resposta.
+    """
     def alloc_courier(entregador_dict, id_pedido, rota_restaurante, rota_cliente):
+        """Inicializa as rotas calculadas no estado em memória do entregador."""
         entregador_dict["id_pedido"] = id_pedido
         entregador_dict["edge_idx"] = 0
         entregador_dict["rota_restaurante"] = rota_restaurante
@@ -616,10 +659,17 @@ async def requester(queue, results):
 
             queue.task_done()
 
-# MUDANÇA: A cozinha agora é um processo contínuo e independente
 async def restaurant_updater(queue, current_ritmo, duracao):
+    """
+    Simula os restaurantes processando e preparando os pedidos que chegam.
+    
+    Args:
+        queue (asyncio.Queue): Fila de tarefas.
+        current_ritmo (list): Index da fase de tráfego atual.
+        duracao (int): Tempo total da simulação em segundos.
+    """
     start = time.perf_counter()
-    volume_cozinha = 20 # Ritmo fixo e rápido da cozinha para dar conta do volume
+    volume_cozinha = 20 
 
     while time.perf_counter() - start < duracao:
         current_start = time.perf_counter()
@@ -636,7 +686,6 @@ async def restaurant_updater(queue, current_ritmo, duracao):
             id_pedido = None
             novo_status = None
 
-            # Fast-Food Logic para evitar o travamento da fila
             if preparando and (random.random() <= 0.8 or not confirmados):
                 id_pedido = random.choice(preparando)
                 novo_status = "READY_FOR_PICKUP"
@@ -663,10 +712,20 @@ async def restaurant_updater(queue, current_ritmo, duracao):
         await asyncio.sleep(max(delta_sleep, 0))
 
 async def move_courier(id_entregador):
+    """
+    Atualiza as coordenadas (latitude/longitude) do entregador baseando-se em sua rota atual.
+    
+    Args:
+        id_entregador (int): ID do entregador sendo movimentado.
+        
+    Returns:
+        tuple: (lat, long, boolean indicando mudança de rota)
+    """
     fim_rota = False 
     mudanca_rota = False
     
     def compute_new_desl(entregador):
+        """Calcula o vetor de deslocamento baseado na velocidade e distância na aresta do grafo."""
         edge_idx = entregador["edge_idx"]
         rota_atual = entregador["rota_atual"]
         
@@ -732,9 +791,17 @@ async def move_courier(id_entregador):
 
     return entregador["posicao"][0], entregador["posicao"][1], mudanca_rota
 
-# MUDANÇA: O entregador agora é um processo contínuo e independente
 async def updater_courier(queue, current_ritmo, duracao):
+    """
+    Processo contínuo e independente que move os entregadores e gera as atualizações de localização via HTTP.
+    
+    Args:
+        queue (asyncio.Queue): Fila de tarefas para disparar eventos HTTP.
+        current_ritmo (list): Index apontando para a fase da simulação.
+        duracao (int): Duração total em segundos.
+    """
     def desalloc_courier(entregador_dict):
+        """Limpa o estado de rota e dados do pedido de um entregador quando ele finaliza a entrega."""
         entregador_dict["id_pedido"] = None
         entregador_dict["edge_idx"] = None
         entregador_dict["rota_restaurante"] = None
@@ -785,12 +852,12 @@ async def updater_courier(queue, current_ritmo, duracao):
         except Exception as e:
             print(f"\n[ERRO CRÍTICO NO SIMULADOR] O entregador travou: {e}")
 
-        # O motor bate exatamente a cada 0.1s de forma contínua
         current_100ms += 0.1
         delta = start + current_100ms - time.perf_counter()
         await asyncio.sleep(max(delta, 0))
 
 async def viewer_courier(queue, volume, duracao, ritmo_idx):
+    """Gera requisições simulando entregadores abrindo o app e checando novas alocações/rotas."""
     start = time.perf_counter()
     current_second = 0
     volume *= 3
@@ -829,6 +896,7 @@ async def viewer_courier(queue, volume, duracao, ritmo_idx):
         await asyncio.sleep(max(delta, 0))
 
 async def producer_order(queue, volume, duracao, ritmo_idx, clientes, restaurantes):
+    """Produtor: Simula clientes entrando no app e fazendo novos pedidos em massa."""
     start = time.perf_counter()
 
     while time.perf_counter() - start < duracao:
@@ -862,6 +930,7 @@ async def producer_order(queue, volume, duracao, ritmo_idx, clientes, restaurant
         await asyncio.sleep(max(delta_sleep, 0))
 
 async def viewer_order(queue, volume, duracao, ritmo_idx):
+    """Simula os clientes que já fizeram pedido abrindo o app para checar o status."""
     start = time.perf_counter()
     await asyncio.sleep(start + 1 - time.perf_counter())
     
@@ -889,6 +958,11 @@ async def viewer_order(queue, volume, duracao, ritmo_idx):
         await asyncio.sleep(max(delta_sleep, 0))
 
 async def run_simulation():
+    """
+    Função principal do simulador: orquestra a geração de dados fakes, preloading via bulk,
+    e a criação de todas as tasks (producers/viewers/updaters) que bombardeiam a API.
+    Apresenta as latências de resposta no final.
+    """
     print(f"\n[SIMULADOR] Iniciando tráfego contra a API: {GLOBAL_API_URL}")
     
     ids = {}
@@ -933,11 +1007,9 @@ async def run_simulation():
         for _ in range(CONCURRENCY)
     ]
 
-    # --- NOVA ARQUITETURA DE SIMULAÇÃO CONTÍNUA ---
     total_duracao = sum(r["duracao"] for r in RITMO_EXEC)
-    current_ritmo = [0] # Compartilha a fase atual com os motores de física
+    current_ritmo = [0] 
 
-    # 1. Os "Motores de Física" ligam agora e nunca mais param até o fim da simulação
     motores_background = [
         asyncio.create_task(updater_courier(queue, current_ritmo, total_duracao)),
         asyncio.create_task(restaurant_updater(queue, current_ritmo, total_duracao))
@@ -947,34 +1019,27 @@ async def run_simulation():
         ritmo = RITMO_EXEC[idx]
         volume = VOLUMES[ritmo["volume"]]
         duracao = ritmo["duracao"]
-        current_ritmo[0] = idx # Avisa os motores em qual fase estamos para os logs
+        current_ritmo[0] = idx 
         print(f"RITMO {ritmo['volume']} por {duracao} segundos")
 
-        # 2. Os "Spawners" (Geradores) obedecem as fases. Param e reiniciam.
         producers = [
             asyncio.create_task(producer_order(queue, volume, duracao, idx, clientes, restaurantes)),
             asyncio.create_task(viewer_order(queue, volume, duracao, idx)),
             asyncio.create_task(viewer_courier(queue, volume, duracao, idx)),
         ]
 
-        # REMOVIDO o queue.join() daqui. A transição para o próximo ritmo agora é instantânea!
         await asyncio.gather(*producers)
 
-    # 3. Fim de todas as fases. Espera a esteira esvaziar os últimos pedidos pendentes.
-    # REMOVIDO o queue.join() daqui. A transição para o próximo ritmo agora é instantânea!
-        await asyncio.gather(*producers)
+    await asyncio.gather(*producers)
 
-    # 3. Fim de todas as fases. Aguarda os motores de background pararem.
     await asyncio.gather(*motores_background)
 
-    # 4. Feedback visual de Drenagem da Fila (O Fim da Ilusão do Travamento)
     itens_restantes = queue.qsize()
     if itens_restantes > 0:
         print(f"\n[Aguardando a AWS] O tempo de simulação ({total_duracao}s) acabou!")
         print(f"Devido ao tráfego pesado, {itens_restantes} requisições acumularam na esteira do Python.")
         print("Drenando as requisições restantes para a nuvem para não corromper os logs...")
         
-        # Loop que atualiza a mesma linha do terminal enquanto a fila esvazia
         while not queue.empty():
             print(f"⏳ Faltam processar: {queue.qsize()} requisições...    ", end="\r")
             await asyncio.sleep(0.5)
@@ -982,7 +1047,6 @@ async def run_simulation():
     await queue.join()
     print("\n✅ Todas as requisições foram processadas e respondidas pela API da AWS!")
 
-    # 5. Desliga os garçons (requesters)
     for _ in requesters:
         await queue.put(None)
 
@@ -1027,6 +1091,7 @@ async def run_simulation():
 # CONTROLADOR PRINCIPAL
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
+    """Ponto de entrada (Entrypoint) do script CLI. Interpreta os argumentos e executa a etapa desejada."""
     global GLOBAL_API_URL
     parser = argparse.ArgumentParser(description="Deploy Architecture & Simulator DijkFood")
     parser.add_argument("--step", choices=["allocate", "populate", "destroy", "simulator", "redeploy_ecs"], help="Step to run")
@@ -1054,6 +1119,7 @@ def main():
         GLOBAL_API_URL = api_url
         asyncio.run(run_simulation())
     else:
+        # Se nenhuma flag for passada, roda o fluxo end-to-end por padrão
         arq.allocate()
         arq.populate_s3()
         api_url = arq.get_api_url()
@@ -1064,4 +1130,4 @@ def main():
         arq.destroy()
 
 if __name__ == "__main__":
-    main()
+    main()  
