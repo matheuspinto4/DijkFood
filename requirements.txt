@@ -1,4 +1,0 @@
-fastapi[standard]
-sqlmodel
-psycopg2-binary
-boto3
