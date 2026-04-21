@@ -16,6 +16,11 @@ A solução utiliza uma arquitetura de serviços na AWS.
 
 
 ## Como Executar:
+Primeiramente, garantir que todas as bibliotecas e suas dependências estão instaladas e configuradas:
+
+```bash
+pip install -r requirements.txt
+```
 
 A implantação do sistema, a população de dados, o teste de carga e a destruição do sistema são gerenciados de forma automatizada pelo script `deploy.py`.
 
