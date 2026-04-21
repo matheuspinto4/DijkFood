@@ -4,7 +4,7 @@
 
 ## Resumo
 
-O DijkFood é um serviço de delivery de comida fictício construído para operar em nuvem com foco em aescalabilidade, atomicidade transacional, alta disponibilidade, independência de componentes e durabilidade dos dado. A plataforma foi desenvolvida para gerenciar o ciclo de vida completo de pedidos, calcular rotas sobre o grafo viário de São Paulo e processar a telemetria em tempo real dos entregadores simultaneamente. 
+O DijkFood é um serviço de delivery de comida fictício construído para operar em nuvem com foco em escalabilidade, atomicidade transacional, alta disponibilidade, independência de componentes e durabilidade dos dados. A plataforma foi desenvolvida para gerenciar o ciclo de vida completo de pedidos, calcular rotas sobre o grafo viário de São Paulo e processar a telemetria em tempo real dos entregadores simultaneamente. 
 
 A solução utiliza uma arquitetura de serviços na AWS. 
 
