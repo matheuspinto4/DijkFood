@@ -35,12 +35,26 @@ except Exception:
     ACCOUNT_ID = "000000000000"
     LAB_ROLE_ARN = ""
 
+CPU_WORKER = 1024
+MEMORY_WORKER = 2048
+MIN_INSTANCES_WORKER = 2
+MAX_INSTANCES_WORKER = 30
+
+MIN_INSTANCES_API = 2
+MAX_INSTANCES_API = 30
+
+# CPU_WORKER = 512
+# MEMORY_WORKER = 1024
+
+RDS_INSTANCE_CLASS = "db.t3.micro"
+# RDS_INSTANCE_CLASS = "db.t3.medium"
+
 DB_INSTANCE_ID = "dijkfood-primary"
 DB_NAME        = "dijkfooddb"
 DB_ADMIN_USER  = "dijk_admin"
 DB_PASSWORD    = "DijkFood2026!Cloud"  
 DB_PORT        = 5432
-INSTANCE_CLASS = "db.t3.micro"
+INSTANCE_CLASS = RDS_INSTANCE_CLASS
 PG_VERSION     = "16"
 PG_GROUP_NAME  = "dijkfood-pg16"   
 
@@ -58,8 +72,6 @@ TG_NAME          = "dijkfood-api-tg"
 API_PORT         = 80 
 
 
-CPU_WORKER = 1024
-MEMORY_WORKER = 2048
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURAÇÕES DO SIMULADOR
@@ -82,7 +94,7 @@ VOLUMES = {
 RITMO_EXEC = [
     {
         "volume": "OPERACAO_NORMAL",
-        "duracao": 60
+        "duracao": 200
     },
     {
         "volume": "PICO",
@@ -90,7 +102,7 @@ RITMO_EXEC = [
     },
     {
         "volume": "EVENTO_ESPECIAL",
-        "duracao": 60 
+        "duracao": 30 
     }
 ]
 
@@ -296,8 +308,8 @@ class Arquitetura:
                     ServiceNamespace='ecs',
                     ResourceId=f'service/{ECS_CLUSTER_NAME}/dijkfood-api-service',
                     ScalableDimension='ecs:service:DesiredCount',
-                    MinCapacity=2,
-                    MaxCapacity=10 
+                    MinCapacity=MIN_INSTANCES_API,
+                    MaxCapacity=MAX_INSTANCES_API 
                 )
                 self.app_asg.put_scaling_policy(
                     PolicyName='api-cpu-scaling',
@@ -306,7 +318,7 @@ class Arquitetura:
                     ScalableDimension='ecs:service:DesiredCount',
                     PolicyType='TargetTrackingScaling',
                     TargetTrackingScalingPolicyConfiguration={
-                        'TargetValue': 50.0, 
+                        'TargetValue': 70.0, 
                         'PredefinedMetricSpecification': {'PredefinedMetricType': 'ECSServiceAverageCPUUtilization'},
                         'ScaleOutCooldown': 60,
                         'ScaleInCooldown': 60
@@ -346,8 +358,8 @@ class Arquitetura:
                     ServiceNamespace='ecs',
                     ResourceId=f'service/{ECS_CLUSTER_NAME}/dijkfood-worker-service',
                     ScalableDimension='ecs:service:DesiredCount',
-                    MinCapacity=2,
-                    MaxCapacity=10 
+                    MinCapacity=MIN_INSTANCES_WORKER,
+                    MaxCapacity=MAX_INSTANCES_WORKER 
                 )
                 self.app_asg.put_scaling_policy(
                     PolicyName='worker-cpu-scaling',
@@ -356,7 +368,7 @@ class Arquitetura:
                     ScalableDimension='ecs:service:DesiredCount',
                     PolicyType='TargetTrackingScaling',
                     TargetTrackingScalingPolicyConfiguration={
-                        'TargetValue': 50.0, 
+                        'TargetValue': 70.0, 
                         'PredefinedMetricSpecification': {'PredefinedMetricType': 'ECSServiceAverageCPUUtilization'},
                         'ScaleOutCooldown': 60,
                         'ScaleInCooldown': 60
@@ -1044,6 +1056,11 @@ def main():
     else:
         arq.allocate()
         arq.populate_s3()
+        api_url = arq.get_api_url()
+        if not api_url:
+            return 
+        GLOBAL_API_URL = api_url
+        asyncio.run(run_simulation())
         arq.destroy()
 
 if __name__ == "__main__":
