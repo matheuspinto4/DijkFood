@@ -20,7 +20,7 @@ resource "aws_appautoscaling_policy" "api_cpu" {
     scale_out_cooldown = 60
 
     predefined_metric_specification {
-      predefined_metric_type = "ECSServiceAvarageCPUUtilization"
+      predefined_metric_type = "ECSServiceAverageCPUUtilization"
     }
   }
 }
@@ -47,7 +47,7 @@ resource "aws_appautoscaling_policy" "worker_cpu" {
     scale_out_cooldown = 60
 
     predefined_metric_specification {
-      predefined_metric_type = "ECSServiceAvarageCPUUtilization"
+      predefined_metric_type = "ECSServiceAverageCPUUtilization"
     }
   }
 }
