@@ -24,7 +24,7 @@ resource "aws_ecs_task_definition" "api" {
         protocol = "tcp"
     }]
     enviroment = [
-        {name = "DB_HOST", value = aws_db_instance.postgres.addres},
+        {name = "DB_HOST", value = aws_db_instance.postgres.address},
         {name = "DB_USER", value = var.db_user},
         {name = "DB_PASS", value = var.db_password},
         {name = "DB_NAME", value = var.db_name},
@@ -43,7 +43,7 @@ resource "aws_ecs_task_definition" "api" {
   }])
 }
 
-resource "aws_ecs_Service" "api" {
+resource "aws_ecs_service" "api" {
   name = "dijkfood-api-service"
   cluster = aws_ecs_cluster.main.id
   task_definition = aws_ecs_task_definition.api.arn
