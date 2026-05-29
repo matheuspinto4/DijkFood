@@ -1,4 +1,5 @@
 terraform {
+    #  Alocando o provedor
     required_providers {
        aws = {
         source = "hashicorp/aws"
@@ -7,6 +8,20 @@ terraform {
     }
 }
 
-provider "aws"{
+# Configurando o provedor
+provider "aws" {
     region = "us-east-1"
+}
+
+# Buscando a VPC e Subnets 
+# Buscando os dados que já existem na AWS
+data "aws_vpc" "default" {
+    default = true
+}
+
+data "aws_subnets" "default" {
+    filter {
+        name = "vpc-id"
+        values = [data.aws_vpc.default.id] # Filtra pelo ID da VPC
+    }
 }
