@@ -6,7 +6,7 @@ resource "aws_s3_bucket_versioning" "grafo" {
     bucket = aws_s3_bucket.grafo.id
 
     versioning_configuration {
-      status = "Enable"
+      status = "Enabled"
     }
 }
 
