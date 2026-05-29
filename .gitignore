@@ -4,3 +4,8 @@ __pycache__/
 
 
 config_credenciais.txt
+
+
+terraform/.terraform
+terraform/*.tfstate
+terraform/*.tfstate.backup
