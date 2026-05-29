@@ -1,0 +1,6 @@
+API/
+cache/
+__pycache__/
+
+
+config_credenciais.txt
