@@ -25,3 +25,5 @@ data "aws_subnets" "default" {
         values = [data.aws_vpc.default.id] # Filtra pelo ID da VPC
     }
 }
+
+data "aws_caller_identity" "current" {}
