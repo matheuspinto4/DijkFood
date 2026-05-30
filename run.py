@@ -13,6 +13,7 @@ import random
 import statistics
 import osmnx as ox
 import httpx
+import psycopg2
 import pandas as pd
 from faker import Faker
 from faker.providers import BaseProvider
@@ -67,6 +68,68 @@ def get_terraform_output(key):
     if result.returncode != 0:
         raise RuntimeError(f"Erro ao ler terraform output '{key}':\n{result.stderr}")
     return result.stdout.strip()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SCHEMA
+# ─────────────────────────────────────────────────────────────────────────────
+def read_tfvars_password():
+    with open("terraform/terraform.tfvars", encoding="utf-8") as f:
+        for line in f:
+            if line.strip().startswith("db_password"):
+                return line.split("=")[1].strip().strip('"')
+    raise RuntimeError("db_password não encontrado em terraform/terraform.tfvars")
+
+
+def create_schema():
+    host     = get_terraform_output("rds_endpoint")
+    password = read_tfvars_password()
+
+    print(f"\n[SCHEMA] Conectando ao RDS: {host}")
+    conn = None
+    for attempt in range(1, 7):
+        try:
+            conn = psycopg2.connect(
+                host=host, port=5432, dbname="dijkfooddb",
+                user="dijk_admin", password=password, connect_timeout=10
+            )
+            break
+        except psycopg2.OperationalError as e:
+            print(f"[SCHEMA] Tentativa {attempt}/6 falhou, aguardando 10s... ({e})")
+            if attempt == 6:
+                raise
+            time.sleep(10)
+
+    with conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS clientes (
+                id_cliente SERIAL PRIMARY KEY,
+                nome VARCHAR(80), email VARCHAR(80),
+                telefone VARCHAR(20), latitude DOUBLE PRECISION, longitude DOUBLE PRECISION
+            );
+            CREATE TABLE IF NOT EXISTS restaurantes (
+                id_restaurante SERIAL PRIMARY KEY,
+                nome VARCHAR(80), tipo_cozinha VARCHAR(40),
+                latitude DOUBLE PRECISION, longitude DOUBLE PRECISION
+            );
+            CREATE TABLE IF NOT EXISTS entregadores (
+                id_entregador SERIAL PRIMARY KEY,
+                nome VARCHAR(80), tipo_veiculo VARCHAR(30),
+                status VARCHAR(30) DEFAULT 'AVAILABLE',
+                latitude DOUBLE PRECISION, longitude DOUBLE PRECISION
+            );
+            CREATE TABLE IF NOT EXISTS pedidos (
+                id_pedido SERIAL PRIMARY KEY,
+                id_cliente INT REFERENCES clientes(id_cliente),
+                id_restaurante INT REFERENCES restaurantes(id_restaurante),
+                id_entregador INT REFERENCES entregadores(id_entregador),
+                lista_itens TEXT, status VARCHAR(30) DEFAULT 'CONFIRMED',
+                data DATE, horario TIME
+            );
+        """)
+    conn.commit()
+    conn.close()
+    print("[SCHEMA] Tabelas criadas com sucesso!\n")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -584,11 +647,14 @@ async def run_simulation():
 def main():
     global GLOBAL_API_URL
     parser = argparse.ArgumentParser(description="Operações pós-deploy DijkFood")
-    parser.add_argument("--step", choices=["populate", "simulator"], required=True,
-                        help="populate: gera e envia o grafo ao S3 | simulator: dispara tráfego na API")
+    parser.add_argument("--step", choices=["schema", "populate", "simulator"], required=True,
+                        help="schema: cria as tabelas no RDS | populate: envia o grafo ao S3 | simulator: dispara tráfego na API")
     args = parser.parse_args()
 
-    if args.step == "populate":
+    if args.step == "schema":
+        create_schema()
+
+    elif args.step == "populate":
         bucket_name = get_terraform_output("s3_bucket")
         populate(bucket_name)
 
