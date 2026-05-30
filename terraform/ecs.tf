@@ -33,6 +33,7 @@ resource "aws_ecs_task_definition" "api" {
         {name = "KINESIS_ORDER_EVENTS",     value = aws_kinesis_stream.order_events.name},
         {name = "KINESIS_COURIER_POSITIONS",value = aws_kinesis_stream.courier_positions.name},
         {name = "AWS_REGION_NAME",          value = "us-east-1"},
+        {name = "SQS_QUEUE_URL",            value = aws_sqs_queue.dijkfood_orders_queue.url},
     ]
     logConfiguration = {
         logDriver = "awslogs"
@@ -91,7 +92,8 @@ resource "aws_ecs_task_definition" "worker" {
       { name = "API_URL",                 value = "http://${aws_lb.api.dns_name}" },
       { name = "KINESIS_ALLOCATION_EVENTS",value = aws_kinesis_stream.allocation_events.name },
       { name = "KINESIS_ORDER_EVENTS",     value = aws_kinesis_stream.order_events.name },
-      { name = "AWS_REGION_NAME",          value = "us-east-1" }
+      { name = "AWS_REGION_NAME",          value = "us-east-1" },
+      { name = "SQS_QUEUE_URL",             value = aws_sqs_queue.dijkfood_orders_queue.url }
     ]
     logConfiguration = {
       logDriver = "awslogs"
