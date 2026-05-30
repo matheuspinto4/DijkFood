@@ -24,6 +24,6 @@ resource "aws_db_instance" "postgres" {
     vpc_security_group_ids = [aws_security_group.rds.id]
 
     multi_az = true
-    publicly_accessible = false
+    publicly_accessible = true
     skip_final_snapshot = true
 }

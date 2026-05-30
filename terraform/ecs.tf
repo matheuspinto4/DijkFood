@@ -23,13 +23,13 @@ resource "aws_ecs_task_definition" "api" {
         hostPort = var.api_port
         protocol = "tcp"
     }]
-    enviroment = [
+    environment = [
         {name = "DB_HOST", value = aws_db_instance.postgres.address},
         {name = "DB_USER", value = var.db_user},
         {name = "DB_PASS", value = var.db_password},
         {name = "DB_NAME", value = var.db_name},
-        {name = "DB_EVENTOS", value = var.ddb_table_eventos},
-        {name = "DB_TELEMETRIA", value = var.ddb_table_telemetria},
+        {name = "DDB_EVENTOS", value = var.ddb_table_eventos},
+        {name = "DDB_TELEMETRIA", value = var.ddb_table_telemetria},
     ]
     logConfiguration = {
         logDriver = "awslogs"
