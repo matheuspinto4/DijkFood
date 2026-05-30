@@ -3,6 +3,9 @@ import os
 import uuid
 import boto3
 import json
+import concurrent.futures
+
+_kinesis_pool = concurrent.futures.ThreadPoolExecutor(max_workers=10)
 from enum import Enum
 from datetime import datetime, date, time as datetime_time
 from typing import Annotated
@@ -44,6 +47,27 @@ tabela_alocacoes= dynamodb.Table(NOME_TABELA_ALOCACOES)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Kinesis — publicação de eventos para o dashboard em tempo real
+# ---------------------------------------------------------------------------
+KINESIS_REGION            = os.getenv("AWS_REGION_NAME", "us-east-1")
+KINESIS_ORDER_EVENTS      = os.getenv("KINESIS_ORDER_EVENTS", "dijkfood-order-events")
+KINESIS_COURIER_POSITIONS = os.getenv("KINESIS_COURIER_POSITIONS", "dijkfood-courier-positions")
+kinesis = boto3.client("kinesis", region_name=KINESIS_REGION)
+
+def _put_kinesis(stream_name: str, data: dict, partition_key: str):
+    try:
+        kinesis.put_record(
+            StreamName=stream_name,
+            Data=json.dumps(data).encode("utf-8"),
+            PartitionKey=partition_key
+        )
+    except Exception as e:
+        logger.error(f"[KINESIS] FALHA -> {stream_name}: {type(e).__name__}: {e}")
+
+def publish_kinesis(stream_name: str, data: dict, partition_key: str):
+    _kinesis_pool.submit(_put_kinesis, stream_name, data, partition_key)
 
 # ---------------------------------------------------------------------------
 # Conexão com Banco de Dados RDS (PostgreSQL)
@@ -234,12 +258,17 @@ def atualizar_posicao(id_entregador: int, posicao: PosicaoUpdate):
     try:
         tabela_telemetria.put_item(
             Item={
-                "id_entregador": str(id_entregador), 
+                "id_entregador": str(id_entregador),
                 "timestamp": datetime.utcnow().isoformat(),
                 "latitude": str(posicao.latitude),
                 "longitude": str(posicao.longitude)
             }
         )
+        publish_kinesis(KINESIS_COURIER_POSITIONS, {
+            "id_entregador": id_entregador,
+            "latitude": posicao.latitude,
+            "longitude": posicao.longitude
+        }, partition_key=str(id_entregador))
         return {"status": "Posição recebida"}
     except Exception as e:
         raise HTTPException(status_code=500, detail="Erro ao salvar posição")
@@ -367,6 +396,11 @@ def atualizar_status_pedido(id_pedido: int, update_data: PedidoStatusUpdate, ses
             item_ddb["id_entregador"] = str(pedido.id_entregador)
 
         tabela_eventos.put_item(Item=item_ddb)
+        publish_kinesis(KINESIS_ORDER_EVENTS, {
+            "id_pedido": id_pedido,
+            "status": novo_status,
+            "id_entregador": pedido.id_entregador
+        }, partition_key=str(id_pedido))
         return pedido
     except Exception as e:
         session.rollback()

@@ -9,17 +9,17 @@ r = redis.Redis(
 )
 
 def handler(event, context):
-    path = event.get("rawPath", "")
+    path = event.get("rawPath") or event.get("path", "")
 
     if "/metrics/orders" in path:
         return resp(200, {
             "total": int(r.get("orders:total") or 0),
             "por_status": {
-                "CONFIRMED":       int(r.get("orders:status:CONFIRMED") or 0),
-                "PREPARING":       int(r.get("orders:status:PREPARING") or 0),
-                "READY_FOR_PICKUP":int(r.get("orders:status:READY_FOR_PICKUP") or 0),
-                "IN_TRANSIT":      int(r.get("orders:status:IN_TRANSIT") or 0),
-                "DELIVERED":       int(r.get("orders:status:DELIVERED") or 0),
+                "CONFIRMED":        int(r.get("orders:status:CONFIRMED") or 0),
+                "PREPARING":        int(r.get("orders:status:PREPARING") or 0),
+                "READY_FOR_PICKUP": int(r.get("orders:status:READY_FOR_PICKUP") or 0),
+                "IN_TRANSIT":       int(r.get("orders:status:IN_TRANSIT") or 0),
+                "DELIVERED":        int(r.get("orders:status:DELIVERED") or 0),
             }
         })
 

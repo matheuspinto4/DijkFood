@@ -41,7 +41,7 @@ VOLUMES = {
 }
 
 RITMO_EXEC = [
-    {"volume": "OPERACAO_NORMAL", "duracao": 200},
+    {"volume": "OPERACAO_NORMAL", "duracao": 60},
     {"volume": "PICO",            "duracao": 60},
     {"volume": "EVENTO_ESPECIAL", "duracao": 30},
 ]

@@ -1,5 +1,6 @@
 import os
 import time
+import json
 import boto3
 import psycopg2
 import csv
@@ -14,10 +15,25 @@ from decimal import Decimal
 # Configurações de Ambiente
 # ---------------------------------------------------------------------------
 DYNAMODB_REGION = os.getenv("AWS_REGION", "us-east-1")
-boto_config = Config(max_pool_connections=50) # Libera 50 conexões simultâneas
+boto_config = Config(max_pool_connections=50)
 dynamodb = boto3.resource("dynamodb", region_name=DYNAMODB_REGION, config=boto_config)
 NOME_TABELA_ALOCACOES = os.getenv("DDB_ALOCACOES", "dijkfood-alocacao-entregadores")
 tabela_alocacoes = dynamodb.Table(NOME_TABELA_ALOCACOES)
+
+KINESIS_REGION            = os.getenv("AWS_REGION_NAME", "us-east-1")
+KINESIS_ALLOCATION_EVENTS = os.getenv("KINESIS_ALLOCATION_EVENTS", "dijkfood-allocation-events")
+KINESIS_ORDER_EVENTS      = os.getenv("KINESIS_ORDER_EVENTS", "dijkfood-order-events")
+kinesis = boto3.client("kinesis", region_name=KINESIS_REGION)
+
+def publish_kinesis(stream_name, data, partition_key):
+    try:
+        kinesis.put_record(
+            StreamName=stream_name,
+            Data=json.dumps(data).encode("utf-8"),
+            PartitionKey=partition_key
+        )
+    except Exception as e:
+        print(f"[KINESIS] Falha ao publicar em {stream_name}: {e}")
 
 DB_HOST = os.getenv("DB_HOST")
 DB_USER = os.getenv("DB_USER")
@@ -105,6 +121,7 @@ def load_graph(path: str) -> dict[int, list[tuple[int, float]]]:
         for row in reader:
             u, v, w = int(row["from_node"]), int(row["to_node"]), float(row["weight"])
             graph[u].append((v, w))
+            graph[v].append((u, w))  # torna o grafo não-direcionado
     return graph
 
 def load_nodes(path: str) -> dict:
@@ -221,9 +238,10 @@ def main():
                 elapsed = time.perf_counter() - start_time
 
                 if melhor_entregador is None or not caminho_ate_restaurante:
-                    print(f"[WORKER] Caminho impossível pelas ruas para todos os candidatos.")
-                    conn.rollback()
-                    time.sleep(2)
+                    print(f"[WORKER] Caminho impossivel para pedido {id_pedido}. Pulando.")
+                    cur.execute("UPDATE pedidos SET status = 'CONFIRMED' WHERE id_pedido = %s;", (id_pedido,))
+                    conn.commit()
+                    time.sleep(1)
                     continue
 
                 # AJUSTE 3: Calcula a segunda perna da viagem (Restaurante -> Cliente)
@@ -262,7 +280,19 @@ def main():
                     cur.execute("UPDATE entregadores SET status = 'BUSY' WHERE id_entregador = %s;", (melhor_entregador,))
                     cur.execute("UPDATE pedidos SET id_entregador = %s WHERE id_pedido = %s;", (melhor_entregador, id_pedido))
                     conn.commit()
-                    
+
+                    publish_kinesis(KINESIS_ALLOCATION_EVENTS, {
+                        "id_pedido": id_pedido,
+                        "id_entregador": melhor_entregador,
+                        "tempo_calculo_s": round(elapsed, 4)
+                    }, partition_key=str(melhor_entregador))
+
+                    publish_kinesis(KINESIS_ORDER_EVENTS, {
+                        "id_pedido": id_pedido,
+                        "status": "ALLOCATED",
+                        "id_entregador": melhor_entregador
+                    }, partition_key=str(id_pedido))
+
                 except Exception as e:
                     print(f"[WORKER] Erro gravando no DynamoDB: {e}")
                     conn.rollback()
