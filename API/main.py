@@ -33,6 +33,9 @@ DYNAMODB_REGION = os.getenv("AWS_REGION", "us-east-1")
 boto_config = Config(max_pool_connections=50)
 dynamodb = boto3.resource("dynamodb", region_name=DYNAMODB_REGION, config=boto_config)
 
+SQS_QUEUE_URL = os.getenv("SQS_QUEUE_URL")
+sqs_client = boto3.client("sqs", region_name=DYNAMODB_REGION, config=boto_config)
+
 NOME_TABELA_EVENTOS = os.getenv("DDB_EVENTOS", "dijkfood-historico-eventos")
 tabela_eventos = dynamodb.Table(NOME_TABELA_EVENTOS)
 
@@ -244,7 +247,7 @@ def atualizar_posicao(id_entregador: int, posicao: PosicaoUpdate):
     except Exception as e:
         raise HTTPException(status_code=500, detail="Erro ao salvar posição")
 
-# Rotas de Pedidos...
+# Rotas de Pedidos
 @app.get("/pedidos/", response_model=list[Pedido])
 def listar_pedidos(session: SessionDep, offset: int = 0, limit: int = 10):
     return session.exec(select(Pedido).offset(offset).limit(limit)).all()
@@ -270,9 +273,8 @@ def criar_pedido(pedido_in: PedidoCreate, session: SessionDep):
             lista_itens=json.dumps(pedido_in.lista_itens)
         )
         session.add(novo_pedido)
-        session.flush()
+        session.flush() 
 
-        # Omitindo o id_entregador no DDB para evitar gravar a string "None"
         tabela_eventos.put_item(
             Item={
                 "id_pedido": str(novo_pedido.id_pedido),
@@ -281,13 +283,36 @@ def criar_pedido(pedido_in: PedidoCreate, session: SessionDep):
                 "event_id": uuid.uuid4().hex[:8]
             }
         )
+        
         session.commit()
         session.refresh(novo_pedido)
+
+        if SQS_QUEUE_URL:
+            mensagem_sqs = {
+                "id_pedido": novo_pedido.id_pedido,
+                "id_cliente": novo_pedido.id_cliente,
+                "id_restaurante": novo_pedido.id_restaurante,
+                "lista_itens": pedido_in.lista_itens,
+                "latitude_restaurante": restaurante.latitude,
+                "longitude_restaurante": restaurante.longitude,
+                "latitude_cliente": cliente.latitude,
+                "longitude_cliente": cliente.longitude,
+                "status": novo_pedido.status
+            }
+            
+            sqs_client.send_message(
+                QueueUrl=SQS_QUEUE_URL,
+                MessageBody=json.dumps(mensagem_sqs)
+            )
+            logger.info(f"Pedido {novo_pedido.id_pedido} publicado no SQS com sucesso.")
+
         return novo_pedido
+        
     except Exception as e:
         session.rollback()
+        logger.error(f"Erro ao criar pedido: {e}")
         raise HTTPException(status_code=500, detail="Erro ao processar o pedido")
-
+    
 @app.get("/pedidos/{id_pedido}/acompanhamento")
 def acompanhar_pedido(id_pedido: int): 
     try:
