@@ -77,3 +77,56 @@ resource "aws_security_group" "rds" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 }
+
+resource "aws_security_group" "msk" {
+  name = "dijkfood-msk-sg"
+  description = "SG para MSK"
+  vpc_id = data.aws_vpc.default.id 
+
+  ingress {
+    from_port       = 9092
+    to_port         = 9092
+    protocol        = "tcp"
+    security_groups = [aws_security_group.api.id, aws_security_group.worker.id, aws_security_group.lambda.id]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+resource "aws_security_group" "lambda" {
+  name        = "dijkfood-lambda-sg"
+  description = "SG para Lambda"
+  vpc_id      = data.aws_vpc.default.id
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+resource "aws_security_group" "redis" {
+  name        = "dijkfood-redis-sg"
+  description = "SG para ElastiCache Redis"
+  vpc_id      = data.aws_vpc.default.id
+
+  ingress {
+    from_port       = 6379
+    to_port         = 6379
+    protocol        = "tcp"
+    security_groups = [aws_security_group.lambda.id]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
