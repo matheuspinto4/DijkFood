@@ -24,12 +24,15 @@ resource "aws_ecs_task_definition" "api" {
         protocol = "tcp"
     }]
     environment = [
-        {name = "DB_HOST", value = aws_db_instance.postgres.address},
-        {name = "DB_USER", value = var.db_user},
-        {name = "DB_PASS", value = var.db_password},
-        {name = "DB_NAME", value = var.db_name},
-        {name = "DDB_EVENTOS", value = var.ddb_table_eventos},
+        {name = "DB_HOST",        value = aws_db_instance.postgres.address},
+        {name = "DB_USER",        value = var.db_user},
+        {name = "DB_PASS",        value = var.db_password},
+        {name = "DB_NAME",        value = var.db_name},
+        {name = "DDB_EVENTOS",    value = var.ddb_table_eventos},
         {name = "DDB_TELEMETRIA", value = var.ddb_table_telemetria},
+        {name = "DDB_ALOCACOES",  value = var.ddb_table_alocacoes},
+        {name = "AWS_REGION",     value = "us-east-1"},
+        {name = "SQS_QUEUE_URL",  value = aws_sqs_queue.dijkfood_orders_queue.url},
     ]
     logConfiguration = {
         logDriver = "awslogs"
@@ -85,7 +88,9 @@ resource "aws_ecs_task_definition" "worker" {
       { name = "DDB_EVENTOS",   value = var.ddb_table_eventos },
       { name = "DDB_ALOCACOES", value = var.ddb_table_alocacoes },
       { name = "S3_BUCKET",     value = aws_s3_bucket.grafo.id },
-      { name = "API_URL",       value = "http://${aws_lb.api.dns_name}" }
+      { name = "API_URL",       value = "http://${aws_lb.api.dns_name}" },
+      { name = "AWS_REGION",    value = "us-east-1" },
+      { name = "SQS_QUEUE_URL", value = aws_sqs_queue.dijkfood_orders_queue.url }
     ]
     logConfiguration = {
       logDriver = "awslogs"
