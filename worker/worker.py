@@ -5,20 +5,27 @@ import psycopg2
 import csv
 import heapq
 import math
+import json 
 from collections import defaultdict
 from botocore.config import Config
 from datetime import datetime
 from decimal import Decimal
 
 # ---------------------------------------------------------------------------
-# Configurações de Ambiente
+# Configurações de Ambiente & Nuvem
 # ---------------------------------------------------------------------------
 DYNAMODB_REGION = os.getenv("AWS_REGION", "us-east-1")
-boto_config = Config(max_pool_connections=50) # Libera 50 conexões simultâneas
+boto_config = Config(max_pool_connections=50)
+
+# SQS e DynamoDB
+sqs_client = boto3.client("sqs", region_name=DYNAMODB_REGION, config=boto_config)
+SQS_QUEUE_URL = os.getenv("SQS_QUEUE_URL")
+
 dynamodb = boto3.resource("dynamodb", region_name=DYNAMODB_REGION, config=boto_config)
 NOME_TABELA_ALOCACOES = os.getenv("DDB_ALOCACOES", "dijkfood-alocacao-entregadores")
 tabela_alocacoes = dynamodb.Table(NOME_TABELA_ALOCACOES)
 
+# RDS & S3
 DB_HOST = os.getenv("DB_HOST")
 DB_USER = os.getenv("DB_USER")
 DB_PASS = os.getenv("DB_PASS")
@@ -65,24 +72,21 @@ def dijkstra(graph: dict[int, list[tuple[int, float]]], source: int):
     return dist, prev
 
 def extrair_caminho(prev: dict[int, int], source: int, target: int) -> list[int]:
-    """Reconstrói a lista de IDs de nós do destino até a origem."""
     caminho = []
     atual = target
     if atual not in prev and atual != source:
-        return [] # Rota impossível
+        return [] 
     while atual is not None:
         caminho.insert(0, atual)
         atual = prev.get(atual)
     return caminho
 
 def formatar_rota_dynamo(caminho: list[int], graph: dict, dict_nodes: dict) -> list:
-    """Transforma a lista de nós no formato de tuplas exigido, convertendo float para Decimal (exigência do DynamoDB)"""
     rota_formatada = []
     for i in range(len(caminho) - 1):
         u = caminho[i]
         v = caminho[i+1]
         
-        # O Boto3/DynamoDB exige que valores de ponto flutuante sejam enviados como Decimal
         coord_u = (Decimal(str(dict_nodes[u]['lat'])), Decimal(str(dict_nodes[u]['lon'])))
         coord_v = (Decimal(str(dict_nodes[v]['lat'])), Decimal(str(dict_nodes[v]['lon'])))
         
@@ -96,7 +100,7 @@ def formatar_rota_dynamo(caminho: list[int], graph: dict, dict_nodes: dict) -> l
     return rota_formatada
 
 # ---------------------------------------------------------------------------
-# Funções de Nuvem e Carregamento
+# Funções de Nuvem e Carregamento 
 # ---------------------------------------------------------------------------
 def load_graph(path: str) -> dict[int, list[tuple[int, float]]]:
     graph: dict[int, list[tuple[int, float]]] = defaultdict(list)
@@ -126,7 +130,7 @@ def download_graph_from_s3():
 # Worker Principal
 # ---------------------------------------------------------------------------
 def main():
-    print("[WORKER] Iniciando o serviço de cálculo de rotas...")
+    print("[WORKER] Iniciando o serviço de cálculo de rotas com SQS...")
     
     if S3_BUCKET:
         download_graph_from_s3()
@@ -150,34 +154,35 @@ def main():
 
     while True:
         try:
+            # 1. RECEBER MENSAGEM DA FILA SQS (Long Polling de 10s)
+            response = sqs_client.receive_message(
+                QueueUrl=SQS_QUEUE_URL,
+                MaxNumberOfMessages=1,
+                WaitTimeSeconds=10
+            )
+
+            # Se a fila estiver vazia, recomeça o loop
+            if 'Messages' not in response:
+                continue
+
+            # Pega a mensagem e o handle (identificador para poder deletar depois)
+            message = response['Messages'][0]
+            receipt_handle = message['ReceiptHandle']
+            
+            # Converte a String JSON de volta para Dicionário
+            pedido_dados = json.loads(message['Body'])
+            
+            id_pedido = pedido_dados['id_pedido']
+            print(f"\n[WORKER] Novo Pedido SQS Recebido! ID: {id_pedido} ...")
+
+            # 2. EXTRAIR COORDENADAS 
+            res_lat = float(pedido_dados['latitude_restaurante'])
+            res_lon = float(pedido_dados['longitude_restaurante'])
+            cli_lat = float(pedido_dados['latitude_cliente'])
+            cli_lon = float(pedido_dados['longitude_cliente'])
+
             with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT id_pedido, id_restaurante FROM pedidos 
-                    WHERE status in ('PREPARING','READY_FOR_PICKUP') AND id_entregador IS NULL
-                    FOR UPDATE SKIP LOCKED LIMIT 1;
-                """)
-                row_pedido = cur.fetchone()
-
-                if not row_pedido:
-                    conn.rollback()
-                    time.sleep(1)
-                    continue
-
-                id_pedido, id_restaurante = row_pedido
-                print(f"\n[WORKER] Processando Pedido ID: {id_pedido} ...")
-
-                cur.execute("SELECT latitude, longitude FROM restaurantes WHERE id_restaurante = %s;", (id_restaurante,))
-                res_lat, res_lon = cur.fetchone()
-
-                # AJUSTE 2: Precisamos da localização do Cliente para calcular a segunda perna da viagem
-                cur.execute("""
-                    SELECT c.latitude, c.longitude 
-                    FROM clientes c
-                    JOIN pedidos p ON p.id_cliente = c.id_cliente
-                    WHERE p.id_pedido = %s;
-                """, (id_pedido,))
-                cli_lat, cli_lon = cur.fetchone()
-
+                # 3. BUSCAR ENTREGADORES
                 cur.execute("""
                     SELECT id_entregador, latitude, longitude 
                     FROM entregadores 
@@ -188,9 +193,12 @@ def main():
                 if not entregadores_disponiveis:
                     print(f"[WORKER] Nenhum entregador disponível no momento.")
                     conn.rollback()
+                    # Não deletamos a mensagem! Assim, após alguns segundos, ela reaparece na fila
+                    # para tentarmos de novo quando um entregador ficar disponível.
                     time.sleep(2)
                     continue
 
+                # --- Lógica de Matemática de Rotas ---
                 candidatos = []
                 for id_ent, lat_ent, lon_ent in entregadores_disponiveis:
                     dist_reta = haversine(res_lat, res_lon, lat_ent, lon_ent)
@@ -206,7 +214,6 @@ def main():
                 menor_distancia_rua = float('inf')
                 caminho_ate_restaurante = []
 
-                # F. Roda o Dijkstra nos top 3 candidatos e guarda o melhor caminho
                 start_time = time.perf_counter()
                 for _, id_ent, lat_ent, lon_ent in top_3_candidatos:
                     no_entregador = encontrar_no_mais_proximo(lat_ent, lon_ent, dict_nodes)
@@ -221,19 +228,19 @@ def main():
                 elapsed = time.perf_counter() - start_time
 
                 if melhor_entregador is None or not caminho_ate_restaurante:
-                    print(f"[WORKER] Caminho impossível pelas ruas para todos os candidatos.")
+                    print(f"[WORKER] Caminho impossível pelas ruas.")
                     conn.rollback()
                     time.sleep(2)
                     continue
 
-                # AJUSTE 3: Calcula a segunda perna da viagem (Restaurante -> Cliente)
                 distancias_cli, prev_cli = dijkstra(graph, no_restaurante)
                 caminho_ate_cliente = extrair_caminho(prev_cli, no_restaurante, no_cliente)
 
-                # NOVO AJUSTE: Formata as duas pernas da viagem separadamente para o DynamoDB
                 rota_restaurante = formatar_rota_dynamo(caminho_ate_restaurante, graph, dict_nodes)
                 rota_cliente = formatar_rota_dynamo(caminho_ate_cliente, graph, dict_nodes)
+                # -----------------------------------------------------
 
+                # 4. RESERVAR O ENTREGADOR NO RDS (Evitando que 2 workers peguem o mesmo)
                 cur.execute("""
                     SELECT id_entregador FROM entregadores 
                     WHERE id_entregador = %s AND status = 'AVAILABLE' 
@@ -241,13 +248,14 @@ def main():
                 """, (melhor_entregador,))
                 
                 if not cur.fetchone():
-                    print(f"[WORKER] Entregador {melhor_entregador} já ocupado. Reprocessando o pedido...")
+                    print(f"[WORKER] Entregador {melhor_entregador} já ocupado. Recomeçando...")
                     conn.rollback()
                     continue
 
                 print(f"[WORKER] Entregador {melhor_entregador} escolhido! Cálculo: {elapsed:.4f}s")
 
                 try:
+                    # 5. ATUALIZAR BANCOS (Dynamo e RDS)
                     tabela_alocacoes.put_item(
                         Item={
                             "id_entregador": str(melhor_entregador),
@@ -263,9 +271,17 @@ def main():
                     cur.execute("UPDATE pedidos SET id_entregador = %s WHERE id_pedido = %s;", (melhor_entregador, id_pedido))
                     conn.commit()
                     
+                    # 6. MÁGICA FINAL: TUDO DEU CERTO, APAGA A MENSAGEM DA FILA SQS
+                    sqs_client.delete_message(
+                        QueueUrl=SQS_QUEUE_URL,
+                        ReceiptHandle=receipt_handle
+                    )
+                    print(f"[WORKER] Pedido {id_pedido} processado e removido do SQS com sucesso!")
+                    
                 except Exception as e:
-                    print(f"[WORKER] Erro gravando no DynamoDB: {e}")
+                    print(f"[WORKER] Erro gravando nos bancos: {e}")
                     conn.rollback()
+                    # Como deu erro, não apagamos a mensagem. Ela voltará para a fila.
 
         except Exception as e:
             conn.rollback()
