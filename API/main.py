@@ -30,11 +30,14 @@ def converter_decimals(obj):
     return obj
 
 # ---------------------------------------------------------------------------
-# Configurações AWS & DynamoDB
+# Configurações AWS
 # ---------------------------------------------------------------------------
 DYNAMODB_REGION = os.getenv("AWS_REGION", "us-east-1")
 boto_config = Config(max_pool_connections=50)
 dynamodb = boto3.resource("dynamodb", region_name=DYNAMODB_REGION, config=boto_config)
+
+SQS_QUEUE_URL = os.getenv("SQS_QUEUE_URL")
+sqs_client = boto3.client("sqs", region_name=DYNAMODB_REGION, config=boto_config)
 
 NOME_TABELA_EVENTOS = os.getenv("DDB_EVENTOS", "dijkfood-historico-eventos")
 tabela_eventos = dynamodb.Table(NOME_TABELA_EVENTOS)
@@ -43,7 +46,7 @@ NOME_TABELA_TELEMETRIA = os.getenv("DDB_TELEMETRIA", "dijkfood-telemetria-entreg
 tabela_telemetria = dynamodb.Table(NOME_TABELA_TELEMETRIA)
 
 NOME_TABELA_ALOCACOES = os.getenv("DDB_ALOCACOES", "dijkfood-alocacao-entregadores")
-tabela_alocacoes= dynamodb.Table(NOME_TABELA_ALOCACOES)
+tabela_alocacoes = dynamodb.Table(NOME_TABELA_ALOCACOES)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -78,7 +81,7 @@ DB_PASS = os.getenv("DB_PASS")
 DB_NAME = os.getenv("DB_NAME")
 
 DATABASE_URL = os.getenv("DATABASE_URL") or (
-    f"postgresql://{DB_USER}:{DB_PASS}@{DB_HOST}:5432/{DB_NAME}" 
+    f"postgresql://{DB_USER}:{DB_PASS}@{DB_HOST}:5432/{DB_NAME}"
     if DB_HOST else None
 )
 
@@ -128,7 +131,7 @@ class Entregador(SQLModel, table=True):
     id_entregador: int | None = Field(default=None, primary_key=True)
     nome: str
     tipo_veiculo: str
-    status: str | None = Field(default="AVAILABLE") 
+    status: str | None = Field(default="AVAILABLE")
     latitude: float | None = None
     longitude: float | None = None
 
@@ -160,7 +163,7 @@ TRANSICOES_VALIDAS = {
 
 class PedidoStatusUpdate(BaseModel):
     novo_status: StatusPedido
-    id_entregador: int | None = None  # <-- ADICIONADO PARA A API RECEBER O ID
+    id_entregador: int | None = None
 
 class Pedido(SQLModel, table=True):
     __tablename__ = "pedidos"
@@ -185,28 +188,22 @@ app = FastAPI(title="DijkFood API - Produção")
 
 @app.get("/")
 def health_check():
-    """Rota exclusiva para o Health Check do Load Balancer da AWS"""
     return {"status": "ok", "message": "API DijkFood operando normalmente!"}
 
-# Rotas de Clientes, Restaurantes, Entregadores...
 @app.get("/clientes/", response_model=list[Cliente])
 def listar_clientes(session: SessionDep, offset: int = 0, limit: int = 10):
     return session.exec(select(Cliente).offset(offset).limit(limit)).all()
 
 @app.get("/clientes/{id_cliente}/pedidos", response_model=list[Pedido])
 def historico_pedidos_cliente(id_cliente: int, session: SessionDep):
-    """Retorna o histórico de pedidos de um cliente em ordem cronológica (Requisito do trabalho)"""
     cliente = session.get(Cliente, id_cliente)
     if not cliente:
         raise HTTPException(status_code=404, detail="Cliente não encontrado")
-        
-    # Busca pedidos do cliente ordenados pela PK (que equivale a ordem cronológica de criação)
     pedidos = session.exec(
         select(Pedido)
         .where(Pedido.id_cliente == id_cliente)
         .order_by(Pedido.id_pedido.asc())
     ).all()
-    
     return pedidos
 
 @app.post("/clientes/", response_model=Cliente)
@@ -273,7 +270,6 @@ def atualizar_posicao(id_entregador: int, posicao: PosicaoUpdate):
     except Exception as e:
         raise HTTPException(status_code=500, detail="Erro ao salvar posição")
 
-# Rotas de Pedidos...
 @app.get("/pedidos/", response_model=list[Pedido])
 def listar_pedidos(session: SessionDep, offset: int = 0, limit: int = 10):
     return session.exec(select(Pedido).offset(offset).limit(limit)).all()
@@ -301,7 +297,6 @@ def criar_pedido(pedido_in: PedidoCreate, session: SessionDep):
         session.add(novo_pedido)
         session.flush()
 
-        # Omitindo o id_entregador no DDB para evitar gravar a string "None"
         tabela_eventos.put_item(
             Item={
                 "id_pedido": str(novo_pedido.id_pedido),
@@ -310,15 +305,37 @@ def criar_pedido(pedido_in: PedidoCreate, session: SessionDep):
                 "event_id": uuid.uuid4().hex[:8]
             }
         )
+
         session.commit()
         session.refresh(novo_pedido)
+
+        if SQS_QUEUE_URL:
+            mensagem_sqs = {
+                "id_pedido": novo_pedido.id_pedido,
+                "id_cliente": novo_pedido.id_cliente,
+                "id_restaurante": novo_pedido.id_restaurante,
+                "lista_itens": pedido_in.lista_itens,
+                "latitude_restaurante": restaurante.latitude,
+                "longitude_restaurante": restaurante.longitude,
+                "latitude_cliente": cliente.latitude,
+                "longitude_cliente": cliente.longitude,
+                "status": novo_pedido.status
+            }
+            sqs_client.send_message(
+                QueueUrl=SQS_QUEUE_URL,
+                MessageBody=json.dumps(mensagem_sqs)
+            )
+            logger.info(f"Pedido {novo_pedido.id_pedido} publicado no SQS.")
+
         return novo_pedido
+
     except Exception as e:
         session.rollback()
+        logger.error(f"Erro ao criar pedido: {e}")
         raise HTTPException(status_code=500, detail="Erro ao processar o pedido")
 
 @app.get("/pedidos/{id_pedido}/acompanhamento")
-def acompanhar_pedido(id_pedido: int): 
+def acompanhar_pedido(id_pedido: int):
     try:
         resposta = tabela_eventos.query(
             KeyConditionExpression=Key('id_pedido').eq(str(id_pedido)),
@@ -340,7 +357,7 @@ def acompanhar_pedido(id_pedido: int):
         try:
             resp_telemetria = tabela_telemetria.query(
                 KeyConditionExpression=Key('id_entregador').eq(id_entregador_str),
-                ScanIndexForward=False, Limit=1 
+                ScanIndexForward=False, Limit=1
             )
             itens_pos = resp_telemetria.get('Items', [])
             if itens_pos:
@@ -365,7 +382,6 @@ def atualizar_status_pedido(id_pedido: int, update_data: PedidoStatusUpdate, ses
     if not pedido:
         raise HTTPException(status_code=404, detail="Pedido não encontrado")
 
-    # MÁGICA AQUI: A API atualiza o entregador no RDS oficial
     if update_data.id_entregador is not None:
         pedido.id_entregador = update_data.id_entregador
 
@@ -375,9 +391,9 @@ def atualizar_status_pedido(id_pedido: int, update_data: PedidoStatusUpdate, ses
     status_atual = pedido.status
     novo_status = update_data.novo_status.value
     status_esperado = TRANSICOES_VALIDAS.get(status_atual)
-    
+
     if status_esperado != novo_status:
-        raise HTTPException(status_code=400, detail=f"Transição inválida.")
+        raise HTTPException(status_code=400, detail="Transição inválida.")
 
     try:
         pedido.status = novo_status
@@ -385,7 +401,6 @@ def atualizar_status_pedido(id_pedido: int, update_data: PedidoStatusUpdate, ses
         session.commit()
         session.refresh(pedido)
 
-        # MÁGICA NO DYNAMO: Salva o log perfeito
         item_ddb = {
             "id_pedido": str(id_pedido),
             "timestamp": datetime.utcnow().isoformat(),
@@ -411,7 +426,7 @@ def historico_pedido(id_pedido: int):
     try:
         resposta = tabela_eventos.query(
             KeyConditionExpression=Key('id_pedido').eq(str(id_pedido)),
-            ScanIndexForward=True 
+            ScanIndexForward=True
         )
         itens = resposta.get('Items', [])
         if not itens:
@@ -419,9 +434,9 @@ def historico_pedido(id_pedido: int):
         return itens
     except Exception:
         raise HTTPException(status_code=500, detail="Erro no DynamoDB.")
-    
+
 @app.get("/alocacoes/{id_entregador}/acompanhamento")
-def consultar_alocacao(id_entregador: int): 
+def consultar_alocacao(id_entregador: int):
     try:
         resposta = tabela_alocacoes.query(
             KeyConditionExpression=Key('id_entregador').eq(str(id_entregador)),
@@ -447,7 +462,7 @@ def consultar_alocacao(id_entregador: int):
         "rota_restaurante": converter_decimals(rota_restaurante),
         "rota_cliente": converter_decimals(rota_cliente)
     }
-    
+
 @app.post("/alocacoes/{id_entregador}/desativar/{id_pedido}")
 def desativar_alocacao(id_entregador: int, id_pedido: int, session: SessionDep):
     try:
@@ -461,18 +476,16 @@ def desativar_alocacao(id_entregador: int, id_pedido: int, session: SessionDep):
                 "rota_cliente": None
             }
         )
-        
+
         entregador = session.get(Entregador, id_entregador)
         pedido = session.get(Pedido, id_pedido)
-        
+
         if entregador and pedido:
             cliente = session.get(Cliente, pedido.id_cliente)
-            
             entregador.status = "AVAILABLE"
-            if cliente: # O entregador passa a esperar no local da última entrega
+            if cliente:
                 entregador.latitude = cliente.latitude
                 entregador.longitude = cliente.longitude
-                
             session.add(entregador)
             session.commit()
 

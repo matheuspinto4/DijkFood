@@ -24,15 +24,17 @@ resource "aws_ecs_task_definition" "api" {
         protocol = "tcp"
     }]
     environment = [
-        {name = "DB_HOST",                  value = aws_db_instance.postgres.address},
-        {name = "DB_USER",                  value = var.db_user},
-        {name = "DB_PASS",                  value = var.db_password},
-        {name = "DB_NAME",                  value = var.db_name},
-        {name = "DDB_EVENTOS",              value = var.ddb_table_eventos},
-        {name = "DDB_TELEMETRIA",           value = var.ddb_table_telemetria},
-        {name = "KINESIS_ORDER_EVENTS",     value = aws_kinesis_stream.order_events.name},
-        {name = "KINESIS_COURIER_POSITIONS",value = aws_kinesis_stream.courier_positions.name},
-        {name = "AWS_REGION_NAME",          value = "us-east-1"},
+        {name = "DB_HOST",                   value = aws_db_instance.postgres.address},
+        {name = "DB_USER",                   value = var.db_user},
+        {name = "DB_PASS",                   value = var.db_password},
+        {name = "DB_NAME",                   value = var.db_name},
+        {name = "DDB_EVENTOS",               value = var.ddb_table_eventos},
+        {name = "DDB_TELEMETRIA",            value = var.ddb_table_telemetria},
+        {name = "DDB_ALOCACOES",             value = var.ddb_table_alocacoes},
+        {name = "SQS_QUEUE_URL",             value = aws_sqs_queue.dijkfood_orders_queue.url},
+        {name = "KINESIS_ORDER_EVENTS",      value = aws_kinesis_stream.order_events.name},
+        {name = "KINESIS_COURIER_POSITIONS", value = aws_kinesis_stream.courier_positions.name},
+        {name = "AWS_REGION_NAME",           value = "us-east-1"},
     ]
     logConfiguration = {
         logDriver = "awslogs"
@@ -81,14 +83,13 @@ resource "aws_ecs_task_definition" "worker" {
     name  = "dijkfood-worker-container"
     image = var.worker_image
     environment = [
-      { name = "DB_HOST",       value = aws_db_instance.postgres.address },
-      { name = "DB_USER",       value = var.db_user },
-      { name = "DB_PASS",       value = var.db_password },
-      { name = "DB_NAME",       value = var.db_name },
-      { name = "DDB_EVENTOS",              value = var.ddb_table_eventos },
+      { name = "DB_HOST",                  value = aws_db_instance.postgres.address },
+      { name = "DB_USER",                  value = var.db_user },
+      { name = "DB_PASS",                  value = var.db_password },
+      { name = "DB_NAME",                  value = var.db_name },
       { name = "DDB_ALOCACOES",            value = var.ddb_table_alocacoes },
-      { name = "S3_BUCKET",               value = aws_s3_bucket.grafo.id },
-      { name = "API_URL",                 value = "http://${aws_lb.api.dns_name}" },
+      { name = "S3_BUCKET",                value = aws_s3_bucket.grafo.id },
+      { name = "SQS_QUEUE_URL",            value = aws_sqs_queue.dijkfood_orders_queue.url },
       { name = "KINESIS_ALLOCATION_EVENTS",value = aws_kinesis_stream.allocation_events.name },
       { name = "KINESIS_ORDER_EVENTS",     value = aws_kinesis_stream.order_events.name },
       { name = "AWS_REGION_NAME",          value = "us-east-1" }
