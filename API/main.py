@@ -5,7 +5,7 @@ import boto3
 import json
 import concurrent.futures
 
-_kinesis_pool = concurrent.futures.ThreadPoolExecutor(max_workers=10)
+_async_pool = concurrent.futures.ThreadPoolExecutor(max_workers=20)
 from enum import Enum
 from datetime import datetime, date, time as datetime_time
 from typing import Annotated
@@ -70,7 +70,11 @@ def _put_kinesis(stream_name: str, data: dict, partition_key: str):
         logger.error(f"[KINESIS] FALHA -> {stream_name}: {type(e).__name__}: {e}")
 
 def publish_kinesis(stream_name: str, data: dict, partition_key: str):
-    _kinesis_pool.submit(_put_kinesis, stream_name, data, partition_key)
+    _async_pool.submit(_put_kinesis, stream_name, data, partition_key)
+
+def fire_and_forget(fn, *args, **kwargs):
+    """Executa fn em background sem bloquear a requisição."""
+    _async_pool.submit(fn, *args, **kwargs)
 
 # ---------------------------------------------------------------------------
 # Conexão com Banco de Dados RDS (PostgreSQL)
@@ -252,23 +256,18 @@ def criar_entregador(entregador_in: EntregadorCreate, session: SessionDep):
 
 @app.post("/entregadores/{id_entregador}/posicao")
 def atualizar_posicao(id_entregador: int, posicao: PosicaoUpdate):
-    try:
-        tabela_telemetria.put_item(
-            Item={
-                "id_entregador": str(id_entregador),
-                "timestamp": datetime.utcnow().isoformat(),
-                "latitude": str(posicao.latitude),
-                "longitude": str(posicao.longitude)
-            }
-        )
-        publish_kinesis(KINESIS_COURIER_POSITIONS, {
-            "id_entregador": id_entregador,
-            "latitude": posicao.latitude,
-            "longitude": posicao.longitude
-        }, partition_key=str(id_entregador))
-        return {"status": "Posição recebida"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail="Erro ao salvar posição")
+    fire_and_forget(tabela_telemetria.put_item, Item={
+        "id_entregador": str(id_entregador),
+        "timestamp": datetime.utcnow().isoformat(),
+        "latitude": str(posicao.latitude),
+        "longitude": str(posicao.longitude)
+    })
+    publish_kinesis(KINESIS_COURIER_POSITIONS, {
+        "id_entregador": id_entregador,
+        "latitude": posicao.latitude,
+        "longitude": posicao.longitude
+    }, partition_key=str(id_entregador))
+    return {"status": "Posição recebida"}
 
 @app.get("/pedidos/", response_model=list[Pedido])
 def listar_pedidos(session: SessionDep, offset: int = 0, limit: int = 10):
@@ -297,17 +296,17 @@ def criar_pedido(pedido_in: PedidoCreate, session: SessionDep):
         session.add(novo_pedido)
         session.flush()
 
-        tabela_eventos.put_item(
-            Item={
-                "id_pedido": str(novo_pedido.id_pedido),
-                "timestamp": datetime.utcnow().isoformat(),
-                "status": novo_pedido.status,
-                "event_id": uuid.uuid4().hex[:8]
-            }
-        )
-
         session.commit()
         session.refresh(novo_pedido)
+
+        # DynamoDB e SQS em background — não bloqueiam a resposta ao cliente
+        evento = {
+            "id_pedido": str(novo_pedido.id_pedido),
+            "timestamp": datetime.utcnow().isoformat(),
+            "status": novo_pedido.status,
+            "event_id": uuid.uuid4().hex[:8]
+        }
+        fire_and_forget(tabela_eventos.put_item, Item=evento)
 
         if SQS_QUEUE_URL:
             mensagem_sqs = {
@@ -321,11 +320,9 @@ def criar_pedido(pedido_in: PedidoCreate, session: SessionDep):
                 "longitude_cliente": cliente.longitude,
                 "status": novo_pedido.status
             }
-            sqs_client.send_message(
-                QueueUrl=SQS_QUEUE_URL,
-                MessageBody=json.dumps(mensagem_sqs)
-            )
-            logger.info(f"Pedido {novo_pedido.id_pedido} publicado no SQS.")
+            fire_and_forget(sqs_client.send_message,
+                            QueueUrl=SQS_QUEUE_URL,
+                            MessageBody=json.dumps(mensagem_sqs))
 
         return novo_pedido
 
@@ -410,7 +407,8 @@ def atualizar_status_pedido(id_pedido: int, update_data: PedidoStatusUpdate, ses
         if pedido.id_entregador:
             item_ddb["id_entregador"] = str(pedido.id_entregador)
 
-        tabela_eventos.put_item(Item=item_ddb)
+        # DynamoDB e Kinesis em background — não bloqueiam a resposta
+        fire_and_forget(tabela_eventos.put_item, Item=item_ddb)
         publish_kinesis(KINESIS_ORDER_EVENTS, {
             "id_pedido": id_pedido,
             "status": novo_status,
