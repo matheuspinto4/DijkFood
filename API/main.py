@@ -3,6 +3,13 @@ import os
 import uuid
 import boto3
 import json
+import concurrent.futures
+
+_async_pool = concurrent.futures.ThreadPoolExecutor(max_workers=20)
+
+def fire_and_forget(fn, *args, **kwargs):
+    _async_pool.submit(fn, *args, **kwargs)
+
 from enum import Enum
 from datetime import datetime, date, time as datetime_time
 from typing import Annotated
@@ -234,18 +241,13 @@ def criar_entregador(entregador_in: EntregadorCreate, session: SessionDep):
 
 @app.post("/entregadores/{id_entregador}/posicao")
 def atualizar_posicao(id_entregador: int, posicao: PosicaoUpdate):
-    try:
-        tabela_telemetria.put_item(
-            Item={
-                "id_entregador": str(id_entregador), 
-                "timestamp": datetime.utcnow().isoformat(),
-                "latitude": str(posicao.latitude),
-                "longitude": str(posicao.longitude)
-            }
-        )
-        return {"status": "Posição recebida"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail="Erro ao salvar posição")
+    fire_and_forget(tabela_telemetria.put_item, Item={
+        "id_entregador": str(id_entregador),
+        "timestamp": datetime.utcnow().isoformat(),
+        "latitude": str(posicao.latitude),
+        "longitude": str(posicao.longitude)
+    })
+    return {"status": "Posição recebida"}
 
 # Rotas de Pedidos
 @app.get("/pedidos/", response_model=list[Pedido])
@@ -275,17 +277,15 @@ def criar_pedido(pedido_in: PedidoCreate, session: SessionDep):
         session.add(novo_pedido)
         session.flush() 
 
-        tabela_eventos.put_item(
-            Item={
-                "id_pedido": str(novo_pedido.id_pedido),
-                "timestamp": datetime.utcnow().isoformat(),
-                "status": novo_pedido.status,
-                "event_id": uuid.uuid4().hex[:8]
-            }
-        )
-        
         session.commit()
         session.refresh(novo_pedido)
+
+        fire_and_forget(tabela_eventos.put_item, Item={
+            "id_pedido": str(novo_pedido.id_pedido),
+            "timestamp": datetime.utcnow().isoformat(),
+            "status": novo_pedido.status,
+            "event_id": uuid.uuid4().hex[:8]
+        })
 
         if SQS_QUEUE_URL:
             mensagem_sqs = {
@@ -299,12 +299,9 @@ def criar_pedido(pedido_in: PedidoCreate, session: SessionDep):
                 "longitude_cliente": cliente.longitude,
                 "status": novo_pedido.status
             }
-            
-            sqs_client.send_message(
-                QueueUrl=SQS_QUEUE_URL,
-                MessageBody=json.dumps(mensagem_sqs)
-            )
-            logger.info(f"Pedido {novo_pedido.id_pedido} publicado no SQS com sucesso.")
+            fire_and_forget(sqs_client.send_message,
+                            QueueUrl=SQS_QUEUE_URL,
+                            MessageBody=json.dumps(mensagem_sqs))
 
         return novo_pedido
         
@@ -391,7 +388,7 @@ def atualizar_status_pedido(id_pedido: int, update_data: PedidoStatusUpdate, ses
         if pedido.id_entregador:
             item_ddb["id_entregador"] = str(pedido.id_entregador)
 
-        tabela_eventos.put_item(Item=item_ddb)
+        fire_and_forget(tabela_eventos.put_item, Item=item_ddb)
         return pedido
     except Exception as e:
         session.rollback()

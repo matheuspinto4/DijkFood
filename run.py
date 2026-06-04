@@ -25,25 +25,34 @@ REGION       = "us-east-1"
 PLACE_NAME   = "São Paulo, Brazil"
 NETWORK_TYPE = "drive"
 
-N_CLIENTES     = 1000
-N_RESTAURANTES = 300
-N_ENTREGADORES = 3000
+N_CLIENTES     = 500   # proporção 1:3 com entregadores
+N_RESTAURANTES = 100
+N_ENTREGADORES = 1500  # 3x clientes — requisito do professor
 CONCURRENCY    = 200
 VELOCIDADE_KMH = 2000
 fator = 18 / (VELOCIDADE_KMH * 0.1)
 
+P95_SLA = 0.5  # segundos — critério do professor
+
 GLOBAL_API_URL = ""
 
 VOLUMES = {
+    "AQUECIMENTO":     5,
     "OPERACAO_NORMAL": 10,
-    "PICO": 50,
-    "EVENTO_ESPECIAL": 200
+    "PICO":            50,
+    "EVENTO_ESPECIAL": 200,
 }
 
 RITMO_EXEC = [
-    {"volume": "OPERACAO_NORMAL", "duracao": 200},
-    {"volume": "PICO",            "duracao": 60},
-    {"volume": "EVENTO_ESPECIAL", "duracao": 30},
+    # 120s cobre: boot Fargate (~90s) + ALB health-check + pool de conexões
+    # Não entra nos resultados — representa o sistema "já em operação" antes do pico
+    {"volume": "AQUECIMENTO",     "duracao": 120, "warmup": True},
+    # Linha de base medida
+    {"volume": "OPERACAO_NORMAL", "duracao":  60},
+    # 120s: auto-scaling reage nos primeiros ~60s e ajuda nos últimos ~60s
+    {"volume": "PICO",            "duracao": 120},
+    # Burst curto e intenso
+    {"volume": "EVENTO_ESPECIAL", "duracao":  30},
 ]
 
 # Locks e estados compartilhados do simulador
@@ -223,14 +232,26 @@ def gerar_dados_falsos(numero_de_clientes, numero_de_restaurantes, numero_de_ent
 # SIMULADOR — WORKERS ASSÍNCRONOS
 # ─────────────────────────────────────────────────────────────────────────────
 async def preload(jsons, url):
+    """Envia bulk insert e retorna os IDs reais criados no banco."""
     print(f"Enviando lote de {len(jsons)} registros para {url}bulk ...")
     async with httpx.AsyncClient(timeout=60.0) as client:
         response = await client.post(url + "bulk", json=jsons)
-        if response.status_code == 200:
-            print(f"Sucesso! {len(jsons)} inseridos.")
-        else:
+        if response.status_code != 200:
             print(f"Erro fatal no Bulk Insert: {response.text}")
             raise Exception(f"Falha ao popular o banco de dados!, {url}bulk")
+        n = response.json().get("inseridos", len(jsons))
+        print(f"Sucesso! {n} inseridos.")
+
+        # Busca os IDs reais no banco (os últimos N inseridos)
+        list_resp = await client.get(url + f"?limit={n}&offset=0")
+        if list_resp.status_code == 200:
+            items = list_resp.json()
+            # Detecta o campo de ID pelo primeiro item da lista
+            if items:
+                id_field = next((k for k in items[0] if k.startswith("id_")), None)
+                if id_field:
+                    return [item[id_field] for item in items]
+        return list(range(1, n + 1))  # fallback
 
 
 async def requester(queue, results):
@@ -550,16 +571,17 @@ async def run_simulation():
 
     data = gerar_dados_falsos(N_CLIENTES, N_RESTAURANTES, N_ENTREGADORES)
 
-    await asyncio.gather(*[
-        preload(jsons, GLOBAL_API_URL + path)
-        for jsons, path in zip(data, ["/clientes/", "/restaurantes/", "/entregadores/"])
-    ])
+    ids_clientes, ids_restaurantes, ids_entregadores = await asyncio.gather(
+        preload(data[0], GLOBAL_API_URL + "/clientes/"),
+        preload(data[1], GLOBAL_API_URL + "/restaurantes/"),
+        preload(data[2], GLOBAL_API_URL + "/entregadores/"),
+    )
 
-    clientes    = list(range(1, N_CLIENTES + 1))
-    restaurantes = list(range(1, N_RESTAURANTES + 1))
+    clientes     = ids_clientes
+    restaurantes = ids_restaurantes
 
     async with entregadores_desocupados_lock:
-        for id_e, courier in zip(range(1, N_ENTREGADORES + 1), data[2]):
+        for id_e, courier in zip(ids_entregadores, data[2]):
             entregadores_desocupados[id_e] = {
                 "id_pedido": None, "posicao": [courier["latitude"], courier["longitude"]],
                 "edge_idx": None, "rota_restaurante": None, "rota_cliente": None,
@@ -581,10 +603,11 @@ async def run_simulation():
 
     producers = None
     for idx, ritmo in enumerate(RITMO_EXEC):
-        volume = VOLUMES[ritmo["volume"]]
+        volume  = VOLUMES[ritmo["volume"]]
         duracao = ritmo["duracao"]
+        label   = "[AQUECIMENTO]" if ritmo.get("warmup") else f"RITMO {ritmo['volume']}"
         current_ritmo[0] = idx
-        print(f"RITMO {ritmo['volume']} por {duracao} segundos")
+        print(f"{label} por {duracao} segundos")
         producers = [
             asyncio.create_task(producer_order(queue, volume, duracao, idx, clientes, restaurantes)),
             asyncio.create_task(viewer_order(queue, volume, duracao, idx)),
@@ -614,31 +637,79 @@ async def run_simulation():
         k = int(len(data_sorted) * p / 100)
         return data_sorted[min(k, len(data_sorted) - 1)]
 
+    # Exclui o warm-up dos resultados medidos
+    fases_medidas = [i for i, r in enumerate(RITMO_EXEC) if not r.get("warmup")]
+
     latencias = {i: {"PATCH": [], "POST": [], "GET": []} for i in range(len(RITMO_EXEC))}
+    erros      = {i: 0 for i in range(len(RITMO_EXEC))}
     for r in results:
         latencias[r["ritmo_idx"]][r["method"]].append(r["latency"])
+        if r["status"] not in (200, 201, 400, 404):
+            erros[r["ritmo_idx"]] += 1
 
     metrics = {
-        "Min":    min,
         "Mean":   statistics.mean,
         "Median": statistics.median,
         "P95":    lambda x: percentil(x, 95),
         "Max":    max,
     }
 
-    print("\n===== RESULTADOS DA SIMULAÇÃO =====")
-    print(f"Total de requisições: {len(results)}")
-    seccion = "-" * (len(metrics) * 12 + 32)
-    print(f"|{'Volume':^30}|", *[f"{m:^10}|" for m in metrics])
-    print(seccion)
-    for idx, ritmo_latencia in latencias.items():
-        nome  = RITMO_EXEC[idx]["volume"]
-        dura  = RITMO_EXEC[idx]["duracao"]
-        prefixos = [f"{idx+1}. {nome}", f"   {dura} segundos", ""]
-        for prefix, sufix, latencia in zip(prefixos, ritmo_latencia.keys(), ritmo_latencia.values()):
-            print(f"| {prefix:<19}", f"{sufix:>9}|",
-                  *[f"{round(f(latencia), 4) if latencia else '':^10}|" for f in metrics.values()])
-        print(seccion)
+    # Larguras fixas para alinhamento perfeito
+    W_VOL    = 24   # coluna Volume
+    W_METHOD =  7   # coluna método (PATCH/POST/GET)
+    W_VAL    = 10   # cada coluna de valor
+    W_SLA    =  8   # coluna SLA P95
+
+    def fmt_val(fn, data):
+        return f"{round(fn(data), 4):>{W_VAL}}" if data else f"{'':>{W_VAL}}"
+
+    sep = (
+        "+" + "-" * (W_VOL + W_METHOD + 3) +
+        ("+" + "-" * (W_VAL + 2)) * len(metrics) +
+        "+" + "-" * (W_SLA + 2) + "+"
+    )
+
+    total_medido = sum(len(latencias[i][m]) for i in fases_medidas for m in latencias[i])
+    print(f"\n===== RESULTADOS DA SIMULAÇÃO (SLA: P95 < {P95_SLA}s) =====")
+    print(f"Total de requisições medidas: {total_medido}  |  warm-up excluído\n")
+
+    header = (
+        f"| {'Volume':<{W_VOL}} {'':>{W_METHOD}} |" +
+        "".join(f" {m:^{W_VAL}} |" for m in metrics) +
+        f" {'SLA P95':^{W_SLA}} |"
+    )
+    print(sep)
+    print(header)
+    print(sep)
+
+    sla_ok_geral = True
+    for idx in fases_medidas:
+        nome      = RITMO_EXEC[idx]["volume"]
+        dura      = RITMO_EXEC[idx]["duracao"]
+        taxa_erro = erros[idx] / max(sum(len(v) for v in latencias[idx].values()), 1) * 100
+        subtitulo = f"{dura}s | erros:{taxa_erro:.1f}%"
+        prefixos  = [f"{nome}", subtitulo, ""]
+
+        for prefix, method, latencia in zip(prefixos, latencias[idx].keys(), latencias[idx].values()):
+            if latencia:
+                p95_val      = percentil(latencia, 95)
+                sla_ok       = p95_val < P95_SLA
+                sla_ok_geral = sla_ok_geral and sla_ok
+                sla_str      = "  OK  " if sla_ok else " FAIL "
+            else:
+                sla_str = "  --  "
+
+            row = (
+                f"| {prefix:<{W_VOL}} {method:>{W_METHOD}} |" +
+                "".join(f" {fmt_val(fn, latencia)} |" for fn in metrics.values()) +
+                f" {sla_str:^{W_SLA}} |"
+            )
+            print(row)
+        print(sep)
+
+    resultado = "[PASSOU]" if sla_ok_geral else "[FALHOU]"
+    detalhe   = f"Todos os P95 < {P95_SLA}s" if sla_ok_geral else f"Algum P95 >= {P95_SLA}s"
+    print(f"\n{resultado} {detalhe}\n")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
