@@ -58,12 +58,12 @@ variable "ecs_cluster_name" {
 
 variable "api_image" {
   type    = string
-  default = "matheuspinto4/dijkfood-api:latest"
+  default = "carlosdaniel23/dijkfood-api:latest"
 }
 
 variable "worker_image" {
   type    = string
-  default = "matheuspinto4/dijkfood-worker:latest"
+  default = "carlosdaniel23/dijkfood-worker:latest"
 }
 
 variable "api_port" {

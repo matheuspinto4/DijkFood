@@ -55,6 +55,7 @@ logger = logging.getLogger(__name__)
 # Kinesis — publicação de eventos para o dashboard em tempo real
 # ---------------------------------------------------------------------------
 KINESIS_REGION            = os.getenv("AWS_REGION_NAME", "us-east-1")
+KINESIS_NEW_ORDER         = os.getenv("KINESIS_NEW_ORDER", "dijkfood-new-order")
 KINESIS_ORDER_EVENTS      = os.getenv("KINESIS_ORDER_EVENTS", "dijkfood-order-events")
 KINESIS_COURIER_POSITIONS = os.getenv("KINESIS_COURIER_POSITIONS", "dijkfood-courier-positions")
 kinesis = boto3.client("kinesis", region_name=KINESIS_REGION)
@@ -256,14 +257,16 @@ def criar_entregador(entregador_in: EntregadorCreate, session: SessionDep):
 
 @app.post("/entregadores/{id_entregador}/posicao")
 def atualizar_posicao(id_entregador: int, posicao: PosicaoUpdate):
+    timestamp = datetime.utcnow().isoformat()
     fire_and_forget(tabela_telemetria.put_item, Item={
         "id_entregador": str(id_entregador),
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": timestamp,
         "latitude": str(posicao.latitude),
         "longitude": str(posicao.longitude)
     })
     publish_kinesis(KINESIS_COURIER_POSITIONS, {
         "id_entregador": id_entregador,
+        "timestamp": timestamp,
         "latitude": posicao.latitude,
         "longitude": posicao.longitude
     }, partition_key=str(id_entregador))
@@ -300,13 +303,26 @@ def criar_pedido(pedido_in: PedidoCreate, session: SessionDep):
         session.refresh(novo_pedido)
 
         # DynamoDB e SQS em background — não bloqueiam a resposta ao cliente
+        timestamp = datetime.utcnow().isoformat()
         evento = {
             "id_pedido": str(novo_pedido.id_pedido),
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": timestamp,
             "status": novo_pedido.status,
             "event_id": uuid.uuid4().hex[:8]
         }
         fire_and_forget(tabela_eventos.put_item, Item=evento)
+        publish_kinesis(KINESIS_NEW_ORDER, {
+            "id_pedido": novo_pedido.id_pedido,
+            "id_cliente": novo_pedido.id_cliente,
+            "id_restaurante": novo_pedido.id_restaurante,
+            "lista_itens": pedido_in.lista_itens,
+            "timestamp": timestamp,
+            "latitude_restaurante": restaurante.latitude,
+            "longitude_restaurante": restaurante.longitude,
+            "latitude_cliente": cliente.latitude,
+            "longitude_cliente": cliente.longitude,
+            "status": novo_pedido.status
+        }, partition_key=str(novo_pedido.id_restaurante))
 
         if SQS_QUEUE_URL:
             mensagem_sqs = {
@@ -398,9 +414,10 @@ def atualizar_status_pedido(id_pedido: int, update_data: PedidoStatusUpdate, ses
         session.commit()
         session.refresh(pedido)
 
+        timestamp = datetime.utcnow().isoformat()
         item_ddb = {
             "id_pedido": str(id_pedido),
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": timestamp,
             "status": novo_status,
             "event_id": uuid.uuid4().hex[:8]
         }
@@ -411,6 +428,7 @@ def atualizar_status_pedido(id_pedido: int, update_data: PedidoStatusUpdate, ses
         fire_and_forget(tabela_eventos.put_item, Item=item_ddb)
         publish_kinesis(KINESIS_ORDER_EVENTS, {
             "id_pedido": id_pedido,
+            "timestamp": timestamp,
             "status": novo_status,
             "id_entregador": pedido.id_entregador
         }, partition_key=str(id_pedido))

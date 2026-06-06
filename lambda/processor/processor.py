@@ -2,6 +2,35 @@ import json
 import base64
 import os
 import redis
+import datetime
+
+from shapely.geometry import shape, Point
+from shapely.strtree import STRtree
+from pyproj import Transformer
+from shapely.geometry import Point
+
+transformer = Transformer.from_crs(
+    "EPSG:4326",   # lat/lon
+    "EPSG:31983",  # GeoSampa
+    always_xy=True
+)
+
+# Configuracoes de poligonos para obter regioes
+with open("geoportal_distrito_municipal_v2.geojson", encoding="utf-8") as f:
+    geojson = json.load(f)
+
+poligonos = []
+distritos = []
+regioes = []
+
+for feature in geojson["features"]:
+    poligonos.append(shape(feature["geometry"]))
+    distritos.append(feature["properties"]["nm_distrito_municipal"])
+    regioes.append(feature["properties"]["nm_regiao_05"])
+    
+tree = STRtree(poligonos)
+
+
 
 print(f"[INIT] Conectando ao Redis: {os.environ.get('REDIS_HOST', 'NAO DEFINIDO')}")
 
@@ -27,9 +56,55 @@ def handler(event, context):
 
     return {"statusCode": 200}
 
+def obter_distrito_regiao(lat, lon):
+    if lat is None or lon is None: return None, None
+    x, y = transformer.transform(lon, lat)
+    ponto = Point(x, y)
+
+    indices_candidatos = tree.query(ponto)
+    print(indices_candidatos)
+
+    for poligono_idx in indices_candidatos:
+        if poligonos[poligono_idx].contains(ponto):
+            return distritos[poligono_idx], regioes[poligono_idx]
+
+    return None, None
+
+
 def process(stream, payload):
     try:
-        if "order-events" in stream:
+        if "new-order" in stream:
+            id_pedido = payload.get("id_pedido", None)
+            timestamp = payload.get("timestamp", datetime.utcnow().isoformat())
+            status = payload.get("status", "UNKNOWN")
+            lat = payload.get("latitude_cliente", None)
+            lon = payload.get("longitude_cliente", None)
+            r.incr("orders:quantity")
+            if id_pedido:
+                r.hset(f"orders:timestamp:{id_pedido}", value=timestamp)
+                r.hset(f"orders:status:{id_pedido}", value=status)
+                distrito, regiao = obter_distrito_regiao(lat, lon)
+                r.hset(f"orders:distrito:{id_pedido}", value=distrito)
+                r.hset(f"orders:region:{id_pedido}", value=regiao)
+                
+                # r.sadd("couriers:active", cid)
+                # r.expire("couriers:active", 30)
+                # print(f"[REDIS] orders-positions → id={cid} ativos={r.scard('couriers:active')}")
+             
+        # publish_kinesis(KINESIS_NEW_ORDER, {
+        #     "id_pedido": novo_pedido.id_pedido,
+        #     "id_cliente": novo_pedido.id_cliente,
+        #     "id_restaurante": novo_pedido.id_restaurante,
+        #     "lista_itens": pedido_in.lista_itens,
+        #     "timestamp": timestamp,
+        #     "latitude_restaurante": restaurante.latitude,
+        #     "longitude_restaurante": restaurante.longitude,
+        #     "latitude_cliente": cliente.latitude,
+        #     "longitude_cliente": cliente.longitude,
+        #     "status": novo_pedido.status
+        # }, partition_key=str(novo_pedido.id_restaurante))
+        
+        elif "order-events" in stream:
             status = payload.get("status", "UNKNOWN")
             r.incr(f"orders:status:{status}")
             r.incr("orders:total")
