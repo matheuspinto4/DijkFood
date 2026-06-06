@@ -75,34 +75,26 @@ def process(stream, payload):
     try:
         if "new-order" in stream:
             id_pedido = payload.get("id_pedido", None)
+            id_restaurante = payload.get("id_restaurante", None)
             timestamp = payload.get("timestamp", datetime.utcnow().isoformat())
             status = payload.get("status", "UNKNOWN")
             lat = payload.get("latitude_cliente", None)
             lon = payload.get("longitude_cliente", None)
+            lista_itens = payload.get("lista_itens", [])
             r.incr("orders:quantity")
             if id_pedido:
-                r.hset(f"orders:timestamp:{id_pedido}", value=timestamp)
-                r.hset(f"orders:status:{id_pedido}", value=status)
+                r.sadd("orders:active", id_pedido)
+                r.sadd("restaurante:active", id_restaurante)
+                r.set(f"orders:restaurante:{id_pedido}", value=id_restaurante)
+                r.set(f"orders:timestamp:{id_pedido}", value=timestamp)
+                r.set(f"orders:status:{id_pedido}", value=status)
                 distrito, regiao = obter_distrito_regiao(lat, lon)
-                r.hset(f"orders:distrito:{id_pedido}", value=distrito)
-                r.hset(f"orders:region:{id_pedido}", value=regiao)
+                r.set(f"orders:distrito:{id_pedido}", value=distrito)
+                r.set(f"orders:region:{id_pedido}", value=regiao)
+                for item in lista_itens:
+                    r.incr(f"item:quantity:{item}")
                 
-                # r.sadd("couriers:active", cid)
-                # r.expire("couriers:active", 30)
-                # print(f"[REDIS] orders-positions → id={cid} ativos={r.scard('couriers:active')}")
-             
-        # publish_kinesis(KINESIS_NEW_ORDER, {
-        #     "id_pedido": novo_pedido.id_pedido,
-        #     "id_cliente": novo_pedido.id_cliente,
-        #     "id_restaurante": novo_pedido.id_restaurante,
-        #     "lista_itens": pedido_in.lista_itens,
-        #     "timestamp": timestamp,
-        #     "latitude_restaurante": restaurante.latitude,
-        #     "longitude_restaurante": restaurante.longitude,
-        #     "latitude_cliente": cliente.latitude,
-        #     "longitude_cliente": cliente.longitude,
-        #     "status": novo_pedido.status
-        # }, partition_key=str(novo_pedido.id_restaurante))
+                print(f"[REDIS] orders-new-order → id={id_pedido} ativos={r.scard('orders:active')}")
         
         elif "order-events" in stream:
             status = payload.get("status", "UNKNOWN")
