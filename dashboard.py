@@ -48,7 +48,9 @@ orders = buscar(API_URL, "/metrics/orders")
 entregadores = buscar(API_URL, "/metrics/entregadores")
 throughput = buscar(API_URL, "/metrics/throughput")
 
-print(orders)
+# print(orders)
+# print(entregadores)
+# print(throughput)
 
 st.title("DijkFood Dashboard")
 
@@ -62,14 +64,12 @@ st.title("DijkFood Dashboard")
 #     42
 # )
 
-print(entregadores)
-
-col1, col2, col3, col4, col5 = st.columns(5)
+col1, col2, col3, col4 = st.columns(4)
 
 with col1:
     st.metric(
         "Pedidos",
-        orders.get("total", 0)
+        orders.get("quantidade", 0)
     )
 
 with col2:
@@ -89,18 +89,20 @@ with col4:
         "Alocações",
         throughput.get("alocacoes_total", 0)
     )
-    
-with col5:
-    st.metric(
-        "Quantidade Total de Pedidos",
-        orders.get("quantidade", 0)
-    )
 
-df = pd.DataFrame(
+df_status = pd.DataFrame(
     orders["por_status"].items(),
     columns=["Status", "Quantidade"]
 )
-
+df = pd.DataFrame(
+    orders["orders"]
+).T
 st.bar_chart(
-    df.set_index("Status")
+    df_status.set_index("Status")
 )
+# print(df)
+# print(df_status)
+
+# print(orders["itens"])
+# print(df_status)
+# print(df.head())

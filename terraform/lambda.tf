@@ -54,6 +54,12 @@ resource "aws_lambda_function" "api_handler" {
   }
 }
 
+resource "aws_lambda_event_source_mapping" "new_order" {
+  event_source_arn  = aws_kinesis_stream.new_order.arn
+  function_name     = aws_lambda_function.processor.arn
+  starting_position = "LATEST"
+}
+
 resource "aws_lambda_event_source_mapping" "order_events" {
   event_source_arn  = aws_kinesis_stream.order_events.arn
   function_name     = aws_lambda_function.processor.arn

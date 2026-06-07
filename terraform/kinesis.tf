@@ -1,3 +1,8 @@
+resource "aws_kinesis_stream" "new_order" {
+  name        = "dijkfood-new-order"
+  shard_count = 1
+}
+
 resource "aws_kinesis_stream" "order_events" {
   name        = "dijkfood-order-events"
   shard_count = 1
