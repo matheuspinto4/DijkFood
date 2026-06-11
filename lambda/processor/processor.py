@@ -4,31 +4,31 @@ import os
 import redis
 from datetime import datetime
 
-# from shapely.geometry import shape, Point
-# from shapely.strtree import STRtree
-# from pyproj import Transformer
-# from shapely.geometry import Point
+from shapely.geometry import shape, Point
+from shapely.strtree import STRtree
+from pyproj import Transformer
+from shapely.geometry import Point
 
-# transformer = Transformer.from_crs(
-#     "EPSG:4326",   # lat/lon
-#     "EPSG:31983",  # GeoSampa
-#     always_xy=True
-# )
+transformer = Transformer.from_crs(
+    "EPSG:4326",   # lat/lon
+    "EPSG:31983",  # GeoSampa
+    always_xy=True
+)
 
-# # Configuracoes de poligonos para obter regioes
-# with open("geoportal_distrito_municipal_v2.geojson", encoding="utf-8") as f:
-#     geojson = json.load(f)
+# Configuracoes de poligonos para obter regioes
+with open("geoportal_distrito_municipal_v2.geojson", encoding="utf-8") as f:
+    geojson = json.load(f)
 
-# poligonos = []
-# distritos = []
-# regioes = []
+poligonos = []
+distritos = []
+regioes = []
 
-# for feature in geojson["features"]:
-#     poligonos.append(shape(feature["geometry"]))
-#     distritos.append(feature["properties"]["nm_distrito_municipal"])
-#     regioes.append(feature["properties"]["nm_regiao_05"])
+for feature in geojson["features"]:
+    poligonos.append(shape(feature["geometry"]))
+    distritos.append(feature["properties"]["nm_distrito_municipal"])
+    regioes.append(feature["properties"]["nm_regiao_05"])
     
-# tree = STRtree(poligonos)
+tree = STRtree(poligonos)
 
 
 # Ordem de mudanca de status
@@ -68,7 +68,6 @@ def handler(event, context):
     return {"statusCode": 200}
 
 def obter_distrito_regiao(lat, lon):
-    return None, None
     if lat is None or lon is None: return None, None
     x, y = transformer.transform(lon, lat)
     ponto = Point(x, y)

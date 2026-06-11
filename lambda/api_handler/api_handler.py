@@ -28,12 +28,14 @@ def handler(event, context):
                 
                 timers = state.pop("timers", {})
                 orders[id_pedido] = {**data, **state, **timers}
-
+                
+        orders_status = r.hgetall("orders:status")
+        orders_status = {
+            status: int(orders_status.get(status) or 0)
+            for status in STATES
+        }
         return resp(200, {
-            "por_status": {
-                k: int(v)
-                for k, v in r.hgetall("orders:status").items()
-            },
+            "por_status": orders_status,
             "itens": {
                 k: int(v)
                 for k, v in r.hgetall("itens:quantity").items()

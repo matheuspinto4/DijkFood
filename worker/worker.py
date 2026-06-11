@@ -263,10 +263,11 @@ def main():
 
                 try:
                     # 7. PERSISTIR: DynamoDB + RDS
+                    timestamp = datetime.utcnow().isoformat()
                     tabela_alocacoes.put_item(
                         Item={
                             "id_entregador": str(melhor_entregador),
-                            "timestamp": datetime.utcnow().isoformat(),
+                            "timestamp": timestamp,
                             "status": "ATIVO",
                             "id_pedido": id_pedido,
                             "rota_restaurante": rota_restaurante,
@@ -289,17 +290,19 @@ def main():
                     publish_kinesis(KINESIS_ALLOCATION_EVENTS, {
                         "id_pedido": id_pedido,
                         "id_entregador": melhor_entregador,
+                        "timestamp": timestamp,
                         "tempo_calculo_s": round(elapsed, 4)
                     }, partition_key=str(melhor_entregador))
 
-                    publish_kinesis(KINESIS_ORDER_EVENTS, {
-                        "id_pedido": id_pedido,
-                        "status": "ALLOCATED",
-                        "id_entregador": melhor_entregador
-                    }, partition_key=str(id_pedido))
+                    # publish_kinesis(KINESIS_ORDER_EVENTS, {
+                    #     "id_pedido": id_pedido,
+                    #     "status": "ALLOCATED",
+                    #     "id_entregador": melhor_entregador
+                    # }, partition_key=str(id_pedido))
 
                 except Exception as e:
                     print(f"[WORKER] Erro gravando nos bancos: {e}")
+                    print(f"[DEBUG] Tipo do TIMESTAMP: {type(timestamp)} - {timestamp}")
                     conn.rollback()
                     # Mensagem não foi deletada — voltará para a fila automaticamente
 

@@ -1,4 +1,5 @@
 import streamlit as st
+import altair as alt
 import subprocess
 import requests
 import time
@@ -8,6 +9,7 @@ import pandas as pd
 from streamlit_autorefresh import st_autorefresh
 
 INTERVALO_SEGUNDOS = 3
+STATES = ["CONFIRMED", "PREPARING", "READY_FOR_PICKUP", "PICKED_UP", "IN_TRANSIT", "DELIVERED"]
 
 @st.cache_resource
 def get_api_gateway_url():
@@ -54,21 +56,11 @@ throughput = buscar(API_URL, "/metrics/throughput")
 
 st.title("DijkFood Dashboard")
 
-# st.metric(
-#     "Pedidos Totais",
-#     1234
-# )
-
-# st.metric(
-#     "Entregadores Ativos",
-#     42
-# )
-
 col1, col2, col3, col4 = st.columns(4)
 
 with col1:
     st.metric(
-        "Pedidos",
+        "Pedidos Ativos",
         orders.get("quantidade", 0)
     )
 
@@ -97,12 +89,29 @@ df_status = pd.DataFrame(
 df = pd.DataFrame(
     orders["orders"]
 ).T
-st.bar_chart(
-    df_status.set_index("Status")
+print(df.shape)
+
+
+chart_orders = alt.Chart(df_status).mark_bar().encode(
+    x=alt.X('Status', sort=None), # O argumento sort=None impede a ordenação
+    y='Quantidade'
 )
-# print(df)
+st.altair_chart(chart_orders, width='stretch')
+
+
+timers = df[[s for s in STATES if s != "DELIVERED" and s in df.columns]].mean().reset_index()
+timers.columns = ["Status", "Tempo (seg)"]
+chart_timers = alt.Chart(timers).mark_bar().encode(
+    x=alt.X('Status', sort=None), # O argumento sort=None impede a ordenação
+    y='Tempo (seg)'
+)
+st.altair_chart(chart_timers, width='stretch')
+
+
+
 # print(df_status)
 
 # print(orders["itens"])
 # print(df_status)
-# print(df.head())
+# if "regiao" in df.columns:
+#     print(df.tail(2))#[~df["regiao"].isna()].head(1))
