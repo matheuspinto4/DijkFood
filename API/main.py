@@ -324,6 +324,23 @@ def criar_pedido(pedido_in: PedidoCreate, session: SessionDep):
                             QueueUrl=SQS_QUEUE_URL,
                             MessageBody=json.dumps(mensagem_sqs))
 
+        # -------------------------------------------------------------------
+        # CORREÇÃO: Publicando o evento de criação completo no Kinesis
+        # -------------------------------------------------------------------
+        evento_kinesis = {
+            "id_pedido": novo_pedido.id_pedido,
+            "id_cliente": novo_pedido.id_cliente,
+            "id_restaurante": novo_pedido.id_restaurante,
+            "id_entregador": None,
+            "lista_itens": pedido_in.lista_itens,
+            "status": novo_pedido.status
+        }
+        publish_kinesis(
+            stream_name=KINESIS_ORDER_EVENTS, 
+            data=evento_kinesis, 
+            partition_key=str(novo_pedido.id_pedido)
+        )
+
         return novo_pedido
 
     except Exception as e:

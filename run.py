@@ -146,19 +146,19 @@ def create_schema():
 # ─────────────────────────────────────────────────────────────────────────────
 def populate(bucket_name):
     print(f"\n[POPULATE] Gerando grafo de '{PLACE_NAME}'...")
-    G = ox.graph_from_place(PLACE_NAME, network_type=NETWORK_TYPE)
+    # G = ox.graph_from_place(PLACE_NAME, network_type=NETWORK_TYPE)
 
-    with open("graph_nodes.csv", "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["node_id", "lat", "lon"])
-        for node_id, data in G.nodes(data=True):
-            writer.writerow([node_id, data["y"], data["x"]])
+    # with open("graph_nodes.csv", "w", newline="", encoding="utf-8") as f:
+    #     writer = csv.writer(f)
+    #     writer.writerow(["node_id", "lat", "lon"])
+    #     for node_id, data in G.nodes(data=True):
+    #         writer.writerow([node_id, data["y"], data["x"]])
 
-    with open("graph_edges.csv", "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["from_node", "to_node", "weight"])
-        for u, v, data in G.edges(data=True):
-            writer.writerow([u, v, data.get("length", 1.0)])
+    # with open("graph_edges.csv", "w", newline="", encoding="utf-8") as f:
+    #     writer = csv.writer(f)
+    #     writer.writerow(["from_node", "to_node", "weight"])
+    #     for u, v, data in G.edges(data=True):
+    #         writer.writerow([u, v, data.get("length", 1.0)])
 
     s3 = boto3.Session(region_name=REGION).client("s3")
     s3.upload_file("graph_nodes.csv", bucket_name, "graph_nodes.csv")

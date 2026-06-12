@@ -12,28 +12,28 @@ function Step($msg) {
 
 # ── 1. Build e Push — Worker ──────────────────────────────────────────────────
 Step "1/7  Build: Worker"
-docker build -t matheuspinto4/dijkfood-worker:latest -f worker/Dockerfile worker/
+docker build -t wallita/dijkfood-worker:latest -f worker/Dockerfile worker/
 if ($LASTEXITCODE -ne 0) { throw "Falha no build do Worker" }
 
 Step "2/7  Push: Worker"
-docker push matheuspinto4/dijkfood-worker:latest
+docker push wallita/dijkfood-worker:latest
 if ($LASTEXITCODE -ne 0) { throw "Falha no push do Worker" }
 
 # ── 2. Build e Push — API ─────────────────────────────────────────────────────
 Step "3/7  Build: API"
-docker build -t matheuspinto4/dijkfood-api:latest -f API/Dockerfile.api API/
+docker build -t wallita/dijkfood-api:latest -f API/Dockerfile.api API/
 if ($LASTEXITCODE -ne 0) { throw "Falha no build da API" }
 
 Step "4/7  Push: API"
-docker push matheuspinto4/dijkfood-api:latest
+docker push wallita/dijkfood-api:latest
 if ($LASTEXITCODE -ne 0) { throw "Falha no push da API" }
 
 # ── 3. Infraestrutura ─────────────────────────────────────────────────────────
 Step "5/7  Terraform: destroy + apply"
 Set-Location terraform
-terraform destroy -auto-approve
+wsl terraform destroy -auto-approve
 if ($LASTEXITCODE -ne 0) { Set-Location ..; throw "Falha no terraform destroy" }
-terraform apply -auto-approve
+wsl terraform apply -auto-approve
 if ($LASTEXITCODE -ne 0) { Set-Location ..; throw "Falha no terraform apply" }
 Set-Location ..
 
