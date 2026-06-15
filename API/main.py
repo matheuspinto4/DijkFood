@@ -56,6 +56,7 @@ logger = logging.getLogger(__name__)
 KINESIS_REGION            = os.getenv("AWS_REGION_NAME", "us-east-1")
 KINESIS_NEW_ORDER         = os.getenv("KINESIS_NEW_ORDER", "dijkfood-new-order")
 KINESIS_ORDER_EVENTS      = os.getenv("KINESIS_ORDER_EVENTS", "dijkfood-order-events")
+KINESIS_ALLOCATION_EVENTS = os.getenv("KINESIS_ALLOCATION_EVENTS", "dijkfood-allocation-events")
 KINESIS_COURIER_POSITIONS = os.getenv("KINESIS_COURIER_POSITIONS", "dijkfood-courier-positions")
 kinesis = boto3.client("kinesis", region_name=KINESIS_REGION, config=boto_config)
 
@@ -256,17 +257,17 @@ def atualizar_posicao(id_entregador: int, posicao: PosicaoUpdate, bg_tasks: Back
         "latitude": str(posicao.latitude),
         "longitude": str(posicao.longitude)
     })
-    bg_tasks.add_task(
-        publish_kinesis, 
-        KINESIS_COURIER_POSITIONS, 
-        {
-            "id_entregador": id_entregador,
-            "timestamp": timestamp,
-            "latitude": posicao.latitude,
-            "longitude": posicao.longitude
-        }, 
-        str(id_entregador)
-    )
+    # bg_tasks.add_task(
+    #     publish_kinesis, 
+    #     KINESIS_COURIER_POSITIONS, 
+    #     {
+    #         "id_entregador": id_entregador,
+    #         "timestamp": timestamp,
+    #         "latitude": posicao.latitude,
+    #         "longitude": posicao.longitude
+    #     }, 
+    #     str(id_entregador)
+    # )
     return {"status": "Posição recebida"}
 
 @app.get("/pedidos/", response_model=list[Pedido])
@@ -491,16 +492,23 @@ def consultar_alocacao(id_entregador: int):
 @app.post("/alocacoes/{id_entregador}/desativar/{id_pedido}")
 def desativar_alocacao(id_entregador: int, id_pedido: int, session: SessionDep):
     try:
+        timestamp = datetime.utcnow().isoformat()
         tabela_alocacoes.put_item(
             Item={
                 "id_entregador": str(id_entregador),
-                "timestamp": datetime.utcnow().isoformat(),
+                "timestamp": timestamp,
                 "status": "INATIVA",
                 "id_pedido": id_pedido,
                 "rota_restaurante": None,
                 "rota_cliente": None
             }
         )
+        publish_kinesis(KINESIS_ALLOCATION_EVENTS, {
+            "id_pedido": id_pedido,
+            "id_entregador": id_entregador,
+            "status": "INATIVA", 
+            "timestamp": timestamp
+        }, partition_key=str(id_entregador))
 
         entregador = session.get(Entregador, id_entregador)
         pedido = session.get(Pedido, id_pedido)

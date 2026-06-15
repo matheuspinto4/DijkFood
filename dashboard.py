@@ -66,46 +66,114 @@ with col1:
 
 with col2:
     st.metric(
-        "Entregadores em pedidos",
-        entregadores.get("ativos", 0)
+        "Total Pedidos",
+        orders.get("total", 0)
     )
 
 with col3:
     st.metric(
-        "Pedidos/min",
-        throughput.get("pedidos_ultimo_minuto", 0)
+        "Entregadores em pedidos",
+        entregadores.get("ativos", 0)
     )
 
+busy_time = entregadores.get("busy_time", 0)
+idle_time = entregadores.get("idle_time", 0)
+total_time = max(busy_time + idle_time, 1)
 with col4:
     st.metric(
-        "Alocações",
-        throughput.get("alocacoes_total", 0)
+        "Ociosidade (%)",
+        round(100 * idle_time / total_time, 2)
     )
+# df = pd.DataFrame(
+#     orders["orders"]
+# ).T
+# print(df.shape)
+
 
 df_status = pd.DataFrame(
     orders["por_status"].items(),
     columns=["Status", "Quantidade"]
 )
-df = pd.DataFrame(
-    orders["orders"]
-).T
-print(df.shape)
-
-
-chart_orders = alt.Chart(df_status).mark_bar().encode(
+chart_status = alt.Chart(df_status).mark_bar().encode(
     x=alt.X('Status', sort=None), # O argumento sort=None impede a ordenação
     y='Quantidade'
 )
-st.altair_chart(chart_orders, width='stretch')
+st.altair_chart(chart_status, width='stretch')
 
 
-timers = df[[s for s in STATES if s != "DELIVERED" and s in df.columns]].mean().reset_index()
-timers.columns = ["Status", "Tempo (seg)"]
-chart_timers = alt.Chart(timers).mark_bar().encode(
-    x=alt.X('Status', sort=None), # O argumento sort=None impede a ordenação
-    y='Tempo (seg)'
+df_mean_duration = pd.DataFrame(
+    orders["duracao_media_por_status"].items(),
+    columns=["Status", "Duração média"]
 )
-st.altair_chart(chart_timers, width='stretch')
+chart_mean_duration = alt.Chart(df_mean_duration).mark_bar().encode(
+    x=alt.X('Status', sort=None), # O argumento sort=None impede a ordenação
+    y='Duração média'
+)
+st.altair_chart(chart_mean_duration, width='stretch')
+
+
+df_regiao = pd.DataFrame(
+    orders["por_regiao"].items(),
+    columns=["Região", "Quantidade"]
+)
+chart_regiao = alt.Chart(df_regiao).mark_bar().encode(
+    x=alt.X('Região', sort=None), # O argumento sort=None impede a ordenação
+    y='Quantidade'
+)
+st.altair_chart(chart_regiao, width='stretch')
+
+
+df_weekday = pd.DataFrame(
+    orders["por_dia_semana"].items(),
+    columns=["Dia/Hora", "Quantidade"]
+)
+chart_weekday = alt.Chart(df_weekday).mark_bar().encode(
+    x=alt.X('Dia/Hora'), # O argumento sort=None impede a ordenação
+    y='Quantidade'
+)
+st.altair_chart(chart_weekday, width='stretch')
+
+
+# df_rest_top10 = pd.DataFrame(
+#     orders["top_10_restaurants"],#.items(),
+#     columns=["Restaurante", "Quantidade"]
+# )
+df_rest_top10 = pd.DataFrame(
+    [
+        {
+            "Restaurante": r["id"],
+            "Quantidade": r["pedidos"]
+        }
+        for r in orders["top_10_restaurants"]
+    ]
+)
+chart_rest_top10 = alt.Chart(df_rest_top10).mark_bar().encode(
+    x=alt.X('Restaurante', sort=None), # O argumento sort=None impede a ordenação
+    y='Quantidade'
+)
+st.altair_chart(chart_rest_top10, width='stretch')
+
+
+df_duracao_hist = pd.DataFrame(
+    orders["histograma_duracao"].items(),
+    columns=["Duração", "Quantidade"]
+)
+chart_duracao_hist = alt.Chart(df_duracao_hist).mark_bar().encode(
+    x=alt.X('Duração', sort=None), # O argumento sort=None impede a ordenação
+    y='Quantidade'
+)
+st.altair_chart(chart_duracao_hist, width='stretch')
+
+print(orders.get("histograma_duracao"))
+
+
+# timers = df[[s for s in STATES if s != "DELIVERED" and s in df.columns]].mean().reset_index()
+# timers.columns = ["Status", "Tempo (seg)"]
+# chart_timers = alt.Chart(timers).mark_bar().encode(
+#     x=alt.X('Status', sort=None), # O argumento sort=None impede a ordenação
+#     y='Tempo (seg)'
+# )
+# st.altair_chart(chart_timers, width='stretch')
 
 
 

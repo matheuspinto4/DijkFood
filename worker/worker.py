@@ -290,8 +290,8 @@ def main():
                     publish_kinesis(KINESIS_ALLOCATION_EVENTS, {
                         "id_pedido": id_pedido,
                         "id_entregador": melhor_entregador,
-                        "timestamp": timestamp,
-                        "tempo_calculo_s": round(elapsed, 4)
+                        "status": "ATIVO", 
+                        "timestamp": timestamp
                     }, partition_key=str(melhor_entregador))
 
                     # publish_kinesis(KINESIS_ORDER_EVENTS, {

@@ -26,9 +26,9 @@ REGION       = "us-east-1"
 PLACE_NAME   = "São Paulo, Brazil"
 NETWORK_TYPE = "drive"
 
-N_CLIENTES     = 500   # proporção 1:3 com entregadores
-N_RESTAURANTES = 100
-N_ENTREGADORES = 1500  # 3x clientes — requisito do professor
+N_CLIENTES     = 5000   # proporção 1:3 com entregadores
+N_RESTAURANTES = 1000
+N_ENTREGADORES = 3 * N_CLIENTES  # 3x clientes — requisito do professor
 CONCURRENCY    = 200
 VELOCIDADE_KMH = 2000
 fator = 18 / (VELOCIDADE_KMH * 0.1)
@@ -49,11 +49,11 @@ RITMO_EXEC = [
     # Não entra nos resultados — representa o sistema "já em operação" antes do pico
     {"volume": "AQUECIMENTO",     "duracao": 120, "warmup": True},
     # Linha de base medida
-    {"volume": "OPERACAO_NORMAL", "duracao":  60},
+    {"volume": "OPERACAO_NORMAL", "duracao":  120},
     # 120s: auto-scaling reage nos primeiros ~60s e ajuda nos últimos ~60s
     {"volume": "PICO",            "duracao": 120},
     # Burst curto e intenso
-    {"volume": "EVENTO_ESPECIAL", "duracao":  30},
+    {"volume": "EVENTO_ESPECIAL", "duracao":  60},
 ]
 
 # Locks e estados compartilhados do simulador

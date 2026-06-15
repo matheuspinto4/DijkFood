@@ -14,39 +14,60 @@ def handler(event, context):
     path = event.get("rawPath") or event.get("path", "")
 
     if "/metrics/orders" in path:
-        # Pega apenas os IDs dos pedidos em andamento
-        ativos = list(r.smembers("orders:active"))
-        orders = {}
-        if ativos:
-            # Faz o fetch em lote (hmget) apenas dos pedidos ativos
-            raw_data = r.hmget("orders:data", ativos)
-            raw_state = r.hmget("orders:state", ativos)
-
-            for id_pedido, d_str, s_str in zip(ativos, raw_data, raw_state):
-                data = json.loads(d_str) if d_str else {}
-                state = json.loads(s_str) if s_str else {}
-                
-                timers = state.pop("timers", {})
-                orders[id_pedido] = {**data, **state, **timers}
-                
         orders_status = r.hgetall("orders:status")
         orders_status = {
             status: int(orders_status.get(status) or 0)
             for status in STATES
         }
+        orders_regioes = {
+            regiao: int(quantity)
+            for regiao, quantity in r.hgetall("orders:regiao").items()
+        }
+        orders_weekdayhour = {
+            weekdayhour: int(quantity)
+            for weekdayhour, quantity in r.hgetall("orders:week_demand").items()
+        }
+        orders_status_qtt = r.hgetall("orders:status_hist_quantity")
+        orders_status_dur = r.hgetall("orders:status_hist_durations")
+        orders_status_duration = {
+            status: float(orders_status_dur.get(status) or 0) / max(int(orders_status_qtt.get(status) or 0), 1)
+            for status in STATES
+        }
+        top_restaurants = [
+            {
+                "id": rid,
+                "pedidos": int(volume)
+            }
+            for rid, volume in r.zrevrange(
+                "restaurants:volume",
+                0,
+                9,
+                withscores=True
+            )
+        ]
         return resp(200, {
             "por_status": orders_status,
+            "por_regiao": orders_regioes, 
+            "por_dia_semana": orders_weekdayhour, 
+            "top_10_restaurants": top_restaurants, 
+            "duracao_media_por_status": orders_status_duration,
+            "histograma_duracao": {
+                int(k): int(v)
+                for k, v in r.hgetall("orders:duration_dist").items()
+            },
             "itens": {
                 k: int(v)
                 for k, v in r.hgetall("itens:quantity").items()
             },
             "quantidade": r.scard("orders:active"),
-            "orders": orders
+            "total": r.get("throughput:orders"),
         })
 
     elif "/metrics/entregadores" in path:
         return resp(200, {
-            "ativos": r.scard("couriers:active")
+            "ativos": r.scard("couriers:active"),
+            "busy_time": float(r.get("couriers:busy_time") or 0), 
+            "idle_time": float(r.get("couriers:idle_time") or 0)
         })
 
     elif "/metrics/throughput" in path:

@@ -88,7 +88,8 @@ def process(stream, payload):
         if "new-order" in stream:
             id_pedido = payload.get("id_pedido", None)
             id_restaurante = payload.get("id_restaurante", None)
-            timestamp = payload.get("timestamp", datetime.utcnow().isoformat())
+            timestamp_str = payload.get("timestamp", datetime.utcnow().isoformat())
+            timestamp = datetime.fromisoformat(timestamp_str)
             status = payload.get("status", "UNKNOWN")
             lat = payload.get("latitude_cliente", None)
             lon = payload.get("longitude_cliente", None)
@@ -97,15 +98,20 @@ def process(stream, payload):
                 # Atualiza metricas agregadas
                 r.sadd("orders:active", id_pedido)
                 r.incr("throughput:orders")
-                r.expire("throughput:orders", 60)
                 r.hincrby("orders:status", status, 1)
+                distrito, regiao = obter_distrito_regiao(lat, lon)
+                r.hincrby("orders:distrito", distrito, 1)
+                r.hincrby("orders:regiao", regiao, 1)
+                hour = timestamp.strftime("%H")
+                day = timestamp.isoweekday()
+                r.hincrby("orders:week_demand", f"{day}-{hour}", 1)
+                r.zincrby("restaurants:volume", 1, id_restaurante)
                 
                 # Atualiza dados de cada pedido e item
-                distrito, regiao = obter_distrito_regiao(lat, lon)
                 r.hset("orders:data", key=id_pedido,
                     value=json.dumps({
                         "restaurante": id_restaurante,
-                        "timestamp_start": timestamp,
+                        "timestamp_start": timestamp_str,
                         "duracao": None, 
                         "distrito": distrito,
                         "regiao": regiao
@@ -114,14 +120,14 @@ def process(stream, payload):
                 r.hset("orders:state", id_pedido,
                     value=json.dumps({
                         "status": status,
-                        "timestamp": timestamp,
+                        "timestamp": timestamp_str,
                         "timers": {state:None for state in STATES}
                     })
                 )
                 for item in lista_itens:
                     r.hincrby("itens:quantity", item, 1)
                 
-            print(f"[REDIS] orders-new-order → id={id_pedido} ativos={r.scard('orders:active')} - payload={payload}")
+            print(f"[REDIS] orders-new-order → id={id_pedido} ativos={r.scard('orders:active')}")# - payload={payload}")
         
         elif "order-events" in stream:
             id_pedido = payload.get("id_pedido", None)
@@ -129,7 +135,7 @@ def process(stream, payload):
             timestamp = datetime.fromisoformat(timestamp_str)
             status = payload.get("status", "UNKNOWN")
             
-            # Inicialização segura como Fallback para impedir UnboundLocalError
+            # Inicializacao segura como Fallback para impedir UnboundLocalError
             timers = {state: None for state in STATES}
             
             # Atualiza as metricas agregadas
@@ -139,8 +145,11 @@ def process(stream, payload):
                 previous_status = previous_data["status"]
                 previous_timestamp = datetime.fromisoformat(previous_data["timestamp"])
                 timers = previous_data["timers"]
-                previous_status_duration = timestamp - previous_timestamp
-                timers[previous_status] = previous_status_duration.total_seconds()
+                duration = timestamp - previous_timestamp
+                duration = duration.total_seconds()
+                timers[previous_status] = duration
+                r.hincrby("orders:status_hist_quantity", previous_status, 1)
+                r.hincrbyfloat("orders:status_hist_durations", previous_status, duration)
                 r.hincrby("orders:status", previous_status, -1)
             r.hincrby("orders:status", status, 1)
             
@@ -160,8 +169,10 @@ def process(stream, payload):
                     order_data = json.loads(order_data)
                     timestamp_start = datetime.fromisoformat(order_data["timestamp_start"])
                     duracao = timestamp - timestamp_start
-                    order_data["duracao"] = duracao.total_seconds()
+                    duracao = duracao.total_seconds()
+                    order_data["duracao"] = duracao
                     r.hset("orders:data", id_pedido, value=json.dumps(order_data))
+                    r.hincrby("orders:duration_dist", int(duracao), 1)
                 
             
             print(f"[REDIS] order-events → status={status} total={r.hget('orders:status',status)}")
@@ -174,13 +185,31 @@ def process(stream, payload):
                     "lon": payload.get("longitude", 0)
                 })
                 r.expire(f"courier:pos:{cid}", 30)
-                r.sadd("couriers:active", cid)
-                r.expire("couriers:active", 30)
-                print(f"[REDIS] courier-positions → id={cid} ativos={r.scard('couriers:active')}")
+                print(f"[REDIS] courier-positions → id={cid}")
 
         elif "allocation-events" in stream:
-            r.incr("allocations:total")
-            print(f"[REDIS] allocation-events → total={r.get('allocations:total')}")
+            id_entregador = payload.get("id_entregador")
+            status = payload.get("status")
+            timestamp_str = payload.get("timestamp")
+            if timestamp_str is None:
+                print(f"[REDIS-ERROR] allocation-events → timestamp missing!")
+                return
+            timestamp = datetime.fromisoformat(timestamp_str) 
+            previous_timestamp_str = r.hget("couriers:allocs", id_entregador)
+            if previous_timestamp_str is None:
+                print(f"[REDIS-PASS] allocation-events → first-alloc-courier{id_entregador}")
+            else:
+                previous_timestamp = datetime.fromisoformat(previous_timestamp_str)
+                duration = timestamp - previous_timestamp
+                duration = duration.total_seconds()
+                if status == "INATIVA":
+                    r.srem("couriers:active", id_entregador)
+                    r.incrbyfloat("couriers:busy_time", duration)
+                else:
+                    r.sadd("couriers:active", id_entregador)
+                    r.incrbyfloat("couriers:idle_time", duration)
+                print(f"[REDIS] allocation-events → total={r.scard('couriers:active')}")
+            r.hset("couriers:allocs", id_entregador, timestamp_str)
 
         else:
             print(f"[HANDLER] stream desconhecido: {stream}")
