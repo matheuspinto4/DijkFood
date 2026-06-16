@@ -164,9 +164,6 @@ chart_duracao_hist = alt.Chart(df_duracao_hist).mark_bar().encode(
 )
 st.altair_chart(chart_duracao_hist, width='stretch')
 
-print(orders.get("histograma_duracao"))
-
-
 # timers = df[[s for s in STATES if s != "DELIVERED" and s in df.columns]].mean().reset_index()
 # timers.columns = ["Status", "Tempo (seg)"]
 # chart_timers = alt.Chart(timers).mark_bar().encode(

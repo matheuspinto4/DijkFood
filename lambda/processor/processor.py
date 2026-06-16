@@ -62,12 +62,13 @@ def handler(event, context):
             base64.b64decode(record["kinesis"]["data"]).decode("utf-8")
         )
         stream = record["eventSourceARN"].split("/")[-1]
-        print(f"[HANDLER] stream={stream} payload={json.dumps(payload)[:100]}")
+        print(f"[HANDLER] stream={stream}")
         process(stream, payload)
 
     return {"statusCode": 200}
 
 def obter_distrito_regiao(lat, lon):
+    return "DISTRITO", "REGIAO"
     if lat is None or lon is None: return None, None
     x, y = transformer.transform(lon, lat)
     ponto = Point(x, y)

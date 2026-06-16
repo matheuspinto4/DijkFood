@@ -75,6 +75,14 @@ def handler(event, context):
             "pedidos_ultimo_minuto": int(r.get("throughput:orders") or 0),
             "alocacoes_total":       int(r.get("allocations:total") or 0),
         })
+        
+    elif "/metrics/restaurantes" in path:
+        return resp(200, {
+            "volumes_maximos": {
+                int(k): int(v)
+                for k, v in r.hgetall("restaurants:volume").items()
+            },
+        })
 
     return resp(404, {"erro": "rota não encontrada"})
 
