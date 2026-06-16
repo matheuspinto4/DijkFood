@@ -61,16 +61,19 @@ kinesis = boto3.client("kinesis", region_name=KINESIS_REGION)
 
 def _put_kinesis(stream_name: str, data: dict, partition_key: str):
     try:
+        # Adicionamos a quebra de linha (\n) para que o Redshift consiga separar os eventos!
+        payload_formatado = json.dumps(data) + "\n"
+        
         kinesis.put_record(
             StreamName=stream_name,
-            Data=json.dumps(data).encode("utf-8"),
+            Data=payload_formatado.encode("utf-8"),
             PartitionKey=partition_key
         )
     except Exception as e:
         logger.error(f"[KINESIS] FALHA -> {stream_name}: {type(e).__name__}: {e}")
 
 def publish_kinesis(stream_name: str, data: dict, partition_key: str):
-    _async_pool.submit(_put_kinesis, stream_name, data, partition_key)
+    _put_kinesis(stream_name, data, partition_key)
 
 def fire_and_forget(fn, *args, **kwargs):
     """Executa fn em background sem bloquear a requisição."""
@@ -313,6 +316,7 @@ def criar_pedido(pedido_in: PedidoCreate, session: SessionDep):
                 "id_pedido": novo_pedido.id_pedido,
                 "id_cliente": novo_pedido.id_cliente,
                 "id_restaurante": novo_pedido.id_restaurante,
+                "nome_restaurante": restaurante.nome if restaurante else "Desconhecido",
                 "lista_itens": pedido_in.lista_itens,
                 "latitude_restaurante": restaurante.latitude,
                 "longitude_restaurante": restaurante.longitude,
@@ -324,16 +328,19 @@ def criar_pedido(pedido_in: PedidoCreate, session: SessionDep):
                             QueueUrl=SQS_QUEUE_URL,
                             MessageBody=json.dumps(mensagem_sqs))
 
-        # -------------------------------------------------------------------
-        # CORREÇÃO: Publicando o evento de criação completo no Kinesis
-        # -------------------------------------------------------------------
         evento_kinesis = {
             "id_pedido": novo_pedido.id_pedido,
             "id_cliente": novo_pedido.id_cliente,
             "id_restaurante": novo_pedido.id_restaurante,
+            "nome_restaurante": restaurante.nome if restaurante else "Desconhecido",
             "id_entregador": None,
             "lista_itens": pedido_in.lista_itens,
-            "status": novo_pedido.status
+            "status": novo_pedido.status,
+            "timestamp": datetime.utcnow().isoformat(), 
+            "latitude_cliente": cliente.latitude,        
+            "longitude_cliente": cliente.longitude,      
+            "latitude_restaurante": restaurante.latitude, 
+            "longitude_restaurante": restaurante.longitude 
         }
         publish_kinesis(
             stream_name=KINESIS_ORDER_EVENTS, 
@@ -424,13 +431,26 @@ def atualizar_status_pedido(id_pedido: int, update_data: PedidoStatusUpdate, ses
         if pedido.id_entregador:
             item_ddb["id_entregador"] = str(pedido.id_entregador)
 
-        # DynamoDB e Kinesis em background — não bloqueiam a resposta
+        # DynamoDB em background
         fire_and_forget(tabela_eventos.put_item, Item=item_ddb)
+        
+        cliente = session.get(Cliente, pedido.id_cliente)
+        restaurante = session.get(Restaurante, pedido.id_restaurante)
+
         publish_kinesis(KINESIS_ORDER_EVENTS, {
             "id_pedido": id_pedido,
+            "id_cliente": pedido.id_cliente,
+            "id_restaurante": pedido.id_restaurante,
+            "nome_restaurante": restaurante.nome if restaurante else "Desconhecido",
             "status": novo_status,
-            "id_entregador": pedido.id_entregador
+            "id_entregador": pedido.id_entregador,
+            "timestamp": datetime.utcnow().isoformat(), 
+            "latitude_cliente": cliente.latitude if cliente else None,
+            "longitude_cliente": cliente.longitude if cliente else None,
+            "latitude_restaurante": restaurante.latitude if restaurante else None,
+            "longitude_restaurante": restaurante.longitude if restaurante else None
         }, partition_key=str(id_pedido))
+        
         return pedido
     except Exception as e:
         session.rollback()
