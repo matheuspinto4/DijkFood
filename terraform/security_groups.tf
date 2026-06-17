@@ -1,3 +1,4 @@
+# --- Security Groups ---
 resource "aws_security_group" "alb" {
   name        = "dijkfood-alb-sg"
   description = "SG para o Load Balancer"
@@ -78,7 +79,6 @@ resource "aws_security_group" "rds" {
   }
 }
 
-
 resource "aws_security_group" "lambda" {
   name        = "dijkfood-lambda-sg"
   description = "SG para Lambda"
@@ -102,6 +102,26 @@ resource "aws_security_group" "redis" {
     to_port         = 6379
     protocol        = "tcp"
     security_groups = [aws_security_group.lambda.id]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+resource "aws_security_group" "redshift_sg" {
+  name        = "redshift-sg"
+  description = "Permitir acesso ao Redshift"
+  vpc_id      = data.aws_vpc.default.id
+
+  ingress {
+    from_port   = 5439
+    to_port     = 5439
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"] # Certifique-se de que a aspa fecha o 0!
   }
 
   egress {

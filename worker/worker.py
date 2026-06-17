@@ -292,10 +292,21 @@ def main():
                         "tempo_calculo_s": round(elapsed, 4)
                     }, partition_key=str(melhor_entregador))
 
+                    # 9. PUBLICAR NO KINESIS (dashboard em tempo real)
+                    # ... (publish do ALLOCATION_EVENTS fica igual) ...
+
                     publish_kinesis(KINESIS_ORDER_EVENTS, {
                         "id_pedido": id_pedido,
+                        "id_cliente": pedido_dados['id_cliente'],
+                        "id_restaurante": pedido_dados['id_restaurante'],
+                        "nome_restaurante": pedido_dados.get('nome_restaurante', 'Desconhecido'), # <-- CORREÇÃO AQUI
                         "status": "ALLOCATED",
-                        "id_entregador": melhor_entregador
+                        "id_entregador": melhor_entregador,
+                        "timestamp": datetime.utcnow().isoformat(), 
+                        "latitude_cliente": float(pedido_dados['latitude_cliente']),
+                        "longitude_cliente": float(pedido_dados['longitude_cliente']),
+                        "latitude_restaurante": float(pedido_dados['latitude_restaurante']),
+                        "longitude_restaurante": float(pedido_dados['longitude_restaurante'])
                     }, partition_key=str(id_pedido))
 
                 except Exception as e:

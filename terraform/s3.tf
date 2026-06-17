@@ -11,5 +11,7 @@ resource "aws_s3_bucket_versioning" "grafo" {
     }
 }
 
-
-
+resource "aws_s3_bucket" "datalake" {
+  bucket        = "dijkfood-datalake-${data.aws_caller_identity.current.account_id}"
+  force_destroy = true
+}

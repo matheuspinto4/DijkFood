@@ -1,6 +1,5 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # deploy_full.ps1 — Build, Push, Infra e Simulação completos
-# Execute da raiz do projeto: .\deploy_full.ps1
 # ─────────────────────────────────────────────────────────────────────────────
 $ErrorActionPreference = "Stop"
 
@@ -11,38 +10,42 @@ function Step($msg) {
 }
 
 # ── 1. Build e Push — Worker ──────────────────────────────────────────────────
-Step "1/7  Build: Worker"
-docker build -t matheuspinto4/dijkfood-worker:latest -f worker/Dockerfile worker/
+Step "1/8  Build: Worker"
+docker build --no-cache -t wallita/dijkfood-worker:latest -f worker/Dockerfile worker/
 if ($LASTEXITCODE -ne 0) { throw "Falha no build do Worker" }
 
-Step "2/7  Push: Worker"
-docker push matheuspinto4/dijkfood-worker:latest
+Step "2/8  Push: Worker"
+docker push wallita/dijkfood-worker:latest
 if ($LASTEXITCODE -ne 0) { throw "Falha no push do Worker" }
 
 # ── 2. Build e Push — API ─────────────────────────────────────────────────────
-Step "3/7  Build: API"
-docker build -t matheuspinto4/dijkfood-api:latest -f API/Dockerfile.api API/
+Step "3/8  Build: API"
+docker build --no-cache -t wallita/dijkfood-api:latest -f API/Dockerfile.api API/
 if ($LASTEXITCODE -ne 0) { throw "Falha no build da API" }
 
-Step "4/7  Push: API"
-docker push matheuspinto4/dijkfood-api:latest
+Step "4/8  Push: API"
+docker push wallita/dijkfood-api:latest
 if ($LASTEXITCODE -ne 0) { throw "Falha no push da API" }
 
-# ── 3. Infraestrutura ─────────────────────────────────────────────────────────
-Step "5/7  Terraform: destroy + apply"
+# ── 4. Infraestrutura ─────────────────────────────────────────────────────────
+Step "5/8  Terraform: destroy + apply"
 Set-Location terraform
-terraform destroy -auto-approve
+wsl terraform destroy -auto-approve
 if ($LASTEXITCODE -ne 0) { Set-Location ..; throw "Falha no terraform destroy" }
-terraform apply -auto-approve
+wsl terraform apply -auto-approve
 if ($LASTEXITCODE -ne 0) { Set-Location ..; throw "Falha no terraform apply" }
 Set-Location ..
 
-# ── 4. Schema + Populate + Simulador ─────────────────────────────────────────
-Step "6/7  Schema + Populate"
-python run.py --step schema
+# ── 5. Schema + Populate + Simulador ─────────────────────────────────────────
+Step "6/8  Schema + Populate"
+wsl bash -ic "python run.py --step schema"
 if ($LASTEXITCODE -ne 0) { throw "Falha no schema" }
-python run.py --step populate
+wsl bash -ic "python run.py --step populate"
 if ($LASTEXITCODE -ne 0) { throw "Falha no populate" }
 
-Step "7/7  Simulador"
-python run.py --step simulator
+Step "7/8  Redshift"
+wsl bash -ic "python analytics/redshift.py"
+if ($LASTEXITCODE -ne 0) { throw "Falha no setup analítico" }
+
+Step "8/8  Simulator"
+wsl bash -ic "python run.py --step simulator"
