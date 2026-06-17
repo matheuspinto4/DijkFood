@@ -151,6 +151,7 @@ def process(stream, payload):
             print(f"[REDIS] orders-new-order → id={id_pedido} ativos={r.scard('orders:active')}")# - payload={payload}")
         
         elif "order-events" in stream:
+            if payload.get("status", True) is None: return # Ignora streams de criacao de pedido e alocacao de entregador
             id_pedido = payload.get("id_pedido", None)
             timestamp_str = payload.get("timestamp", datetime.utcnow().isoformat())
             timestamp = datetime.fromisoformat(timestamp_str)
