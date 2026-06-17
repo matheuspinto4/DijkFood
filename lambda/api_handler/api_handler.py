@@ -1,6 +1,7 @@
 import json
 import os
 import redis
+from datetime import datetime
 
 STATES = ["CONFIRMED", "PREPARING", "READY_FOR_PICKUP", "PICKED_UP", "IN_TRANSIT", "DELIVERED"]
 
@@ -77,11 +78,17 @@ def handler(event, context):
         })
         
     elif "/metrics/restaurantes" in path:
+        now = datetime.utcnow()
+        slot = f"{now.isoweekday()}-{now.strftime('%H')}"
+
+        ativos = int(r.get("metrics:restaurantes:ativos") or 0)
+        ativos_max = int(r.get("metrics:restaurantes:ativos_max") or 1)
+        atual_hora = int(r.get(f"metrics:restaurantes:slot:{slot}") or 0)
+        max_hora = int(r.get(f"metrics:restaurantes:slot_max:{slot}") or 1)
+
         return resp(200, {
-            "volumes_maximos": {
-                int(k): int(v)
-                for k, v in r.hgetall("restaurants:volume").items()
-            },
+            "utilizacao_capacidade": round(100 * ativos / max(ativos_max, 1), 2),
+            "aderencia_horaria": round(100 * atual_hora / max(max_hora, 1), 2),
         })
 
     return resp(404, {"erro": "rota não encontrada"})

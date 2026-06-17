@@ -49,6 +49,9 @@ st_autorefresh(
 orders = buscar(API_URL, "/metrics/orders")
 entregadores = buscar(API_URL, "/metrics/entregadores")
 throughput = buscar(API_URL, "/metrics/throughput")
+restaurantes = buscar(API_URL, "/metrics/restaurantes")
+
+print(restaurantes)
 
 # print(orders)
 # print(entregadores)
@@ -84,10 +87,12 @@ with col4:
         "Ociosidade (%)",
         round(100 * idle_time / total_time, 2)
     )
-# df = pd.DataFrame(
-#     orders["orders"]
-# ).T
-# print(df.shape)
+
+col5, col6 = st.columns(2)
+with col5:
+    st.metric("Utilização da capacidade", f'{restaurantes.get("utilizacao_capacidade", 0)}%')
+with col6:
+    st.metric("Vazão vs histórico do horário", f'{restaurantes.get("aderencia_horaria", 0)}%')
 
 
 df_status = pd.DataFrame(
@@ -152,7 +157,6 @@ chart_rest_top10 = alt.Chart(df_rest_top10).mark_bar().encode(
     y='Quantidade'
 )
 st.altair_chart(chart_rest_top10, width='stretch')
-
 
 df_duracao_hist = pd.DataFrame(
     orders["histograma_duracao"].items(),

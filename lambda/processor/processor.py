@@ -105,9 +105,20 @@ def process(stream, payload):
                 r.hincrby("orders:regiao", regiao, 1)
                 hour = timestamp.strftime("%H")
                 day = timestamp.isoweekday()
-                r.hincrby("orders:week_demand", f"{day}-{hour}", 1)
+                weekdayhour = f"{day}-{hour}"
+                r.hincrby("orders:week_demand", weekdayhour, 1)
                 r.zincrby("restaurants:volume", 1, id_restaurante)
                 
+                cur = r.incr(f"metrics:restaurantes:slot:{weekdayhour}")
+                mx = int(r.get(f"metrics:restaurantes:slot_max:{weekdayhour}") or 0)
+                if cur > mx:
+                    r.set(f"metrics:restaurantes:slot_max:{weekdayhour}", cur)
+
+                ativos = r.incr("metrics:restaurantes:ativos")
+                mx = int(r.get("metrics:restaurantes:ativos_max") or 0)
+                if ativos > mx:
+                    r.set("metrics:restaurantes:ativos_max", ativos)
+                        
                 # Atualiza dados de cada pedido e item
                 r.hset("orders:data", key=id_pedido,
                     value=json.dumps({
@@ -127,6 +138,15 @@ def process(stream, payload):
                 )
                 for item in lista_itens:
                     r.hincrby("itens:quantity", item, 1)
+                    
+                # Atualiza a capacidade maxima do restaurante
+                vol = r.zscore("restaurants:volume", id_restaurante)
+
+                if vol is not None:
+                    vol_max = r.hget("restaurants:volume:max", id_restaurante)
+                    vol_max = float(vol_max) if vol_max is not None else None
+                    if vol_max is None or vol > vol_max:
+                        r.hset("restaurants:volume:max", id_restaurante, vol)
                 
             print(f"[REDIS] orders-new-order → id={id_pedido} ativos={r.scard('orders:active')}")# - payload={payload}")
         
@@ -164,6 +184,7 @@ def process(stream, payload):
             )
             # Finaliza o pedido caso esteja no ultimo estado
             if status == STATES[-1]:
+                r.decr("metrics:restaurantes:ativos")
                 r.srem("orders:active", id_pedido)
                 order_data = r.hget("orders:data", id_pedido)
                 if order_data:
