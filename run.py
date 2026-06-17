@@ -17,6 +17,7 @@ import psycopg2
 import pandas as pd
 from faker import Faker
 from faker.providers import BaseProvider
+import redis
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURAÇÕES
@@ -25,9 +26,9 @@ REGION       = "us-east-1"
 PLACE_NAME   = "São Paulo, Brazil"
 NETWORK_TYPE = "drive"
 
-N_CLIENTES     = 500   # proporção 1:3 com entregadores
-N_RESTAURANTES = 100
-N_ENTREGADORES = 1500  # 3x clientes — requisito do professor
+N_CLIENTES     = 5000   # proporção 1:3 com entregadores
+N_RESTAURANTES = 1000
+N_ENTREGADORES = 3 * N_CLIENTES  # 3x clientes — requisito do professor
 CONCURRENCY    = 200
 VELOCIDADE_KMH = 2000
 fator = 18 / (VELOCIDADE_KMH * 0.1)
@@ -48,11 +49,11 @@ RITMO_EXEC = [
     # Não entra nos resultados — representa o sistema "já em operação" antes do pico
     {"volume": "AQUECIMENTO",     "duracao": 120, "warmup": True},
     # Linha de base medida
-    {"volume": "OPERACAO_NORMAL", "duracao":  60},
+    {"volume": "OPERACAO_NORMAL", "duracao":  120},
     # 120s: auto-scaling reage nos primeiros ~60s e ajuda nos últimos ~60s
     {"volume": "PICO",            "duracao": 120},
     # Burst curto e intenso
-    {"volume": "EVENTO_ESPECIAL", "duracao":  30},
+    {"volume": "EVENTO_ESPECIAL", "duracao":  60},
 ]
 
 # Locks e estados compartilhados do simulador
@@ -712,14 +713,105 @@ async def run_simulation():
     print(f"\n{resultado} {detalhe}\n")
 
 
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLEAN (HARD RESET)
+# ─────────────────────────────────────────────────────────────────────────────
+def clean_databases():
+    print("\n[CLEAN] ⚠️ ATENÇÃO: Isso vai deletar TUDO do Redis, RDS e DynamoDB.")
+    confirmacao = input("Digite 'DELETAR' para confirmar: ")
+    
+    if confirmacao != "DELETAR":
+        print("[CLEAN] Operação abortada. Seus dados estão a salvo.\n")
+        return
+
+    # 1. Limpeza do RDS (PostgreSQL)
+    try:
+        print("\n[CLEAN] Iniciando limpeza do RDS...")
+        host = get_terraform_output("rds_endpoint")
+        password = read_tfvars_password()
+        
+        conn = psycopg2.connect(
+            host=host, port=5432, dbname="dijkfooddb",
+            user="dijk_admin", password=password, connect_timeout=10
+        )
+        with conn.cursor() as cur:
+            cur.execute("TRUNCATE TABLE pedidos, clientes, restaurantes, entregadores CASCADE;")
+        conn.commit()
+        conn.close()
+        print("  ✅ Todas as tabelas do RDS esvaziadas (CASCADE executado).")
+    except Exception as e:
+        print(f"  ❌ Erro ao limpar RDS: {e}")
+
+    # 2. Limpeza do Redis
+    try:
+        print("\n[CLEAN] Iniciando limpeza do REDIS...")
+        try:
+            redis_host = get_terraform_output("redis_endpoint")
+        except RuntimeError:
+            redis_host = "localhost" # Fallback caso o túnel/proxy local esteja rodando
+            
+        r = redis.Redis(host=redis_host, port=6379, decode_responses=True)
+        r.flushall()
+        print("  ✅ Todas as chaves do Redis apagadas com sucesso.")
+    except Exception as e:
+        print(f"  ❌ Erro ao limpar Redis: {e}")
+
+    # 3. Limpeza do DynamoDB
+    try:
+        print("\n[CLEAN] Iniciando limpeza do DYNAMODB...")
+        dynamodb = boto3.resource("dynamodb", region_name=REGION)
+        tabelas_dynamo = [
+            "dijkfood-historico-eventos",
+            "dijkfood-telemetria-entregadores",
+            "dijkfood-alocacao-entregadores"
+        ]
+
+        for nome_tabela in tabelas_dynamo:
+            print(f"  -> Verificando {nome_tabela}...")
+            try:
+                tabela = dynamodb.Table(nome_tabela)
+                chaves_esquema = [k['AttributeName'] for k in tabela.key_schema]
+                
+                # Paginação no Scan
+                response = tabela.scan()
+                itens = response.get('Items', [])
+                
+                while 'LastEvaluatedKey' in response:
+                    response = tabela.scan(ExclusiveStartKey=response['LastEvaluatedKey'])
+                    itens.extend(response.get('Items', []))
+
+                if not itens:
+                    print(f"    [OK] Tabela {nome_tabela} já estava vazia.")
+                    continue
+
+                # Exclusão em lote
+                apagados = 0
+                with tabela.batch_writer() as batch:
+                    for item in itens:
+                        chave_delecao = {k: item[k] for k in chaves_esquema}
+                        batch.delete_item(Key=chave_delecao)
+                        apagados += 1
+
+                print(f"    ✅ {apagados} itens deletados de {nome_tabela}.")
+            except Exception as e:
+                print(f"    ❌ Erro na tabela {nome_tabela}: {e}")
+                
+        print("\n🚀 Hard reset concluído com sucesso!\n")
+    except Exception as e:
+        print(f"  ❌ Erro no fluxo do DynamoDB: {e}")
+
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # ENTRYPOINT
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
     global GLOBAL_API_URL
     parser = argparse.ArgumentParser(description="Operações pós-deploy DijkFood")
-    parser.add_argument("--step", choices=["schema", "populate", "simulator"], required=True,
-                        help="schema: cria as tabelas no RDS | populate: envia o grafo ao S3 | simulator: dispara tráfego na API")
+    parser.add_argument("--step", choices=["schema", "populate", "simulator", "clean"], required=True,
+                        help="schema: cria as tabelas no RDS | populate: envia o grafo ao S3 | simulator: dispara tráfego na API | clean: esvazia bancos")
     args = parser.parse_args()
 
     if args.step == "schema":
@@ -733,7 +825,9 @@ def main():
         GLOBAL_API_URL = get_terraform_output("api_url")
         print(f"[SIMULADOR] API URL: {GLOBAL_API_URL}")
         asyncio.run(run_simulation())
-
+        
+    elif args.step == "clean":
+        clean_databases()
 
 if __name__ == "__main__":
     main()

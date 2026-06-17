@@ -263,10 +263,11 @@ def main():
 
                 try:
                     # 7. PERSISTIR: DynamoDB + RDS
+                    timestamp = datetime.utcnow().isoformat()
                     tabela_alocacoes.put_item(
                         Item={
                             "id_entregador": str(melhor_entregador),
-                            "timestamp": datetime.utcnow().isoformat(),
+                            "timestamp": timestamp,
                             "status": "ATIVO",
                             "id_pedido": id_pedido,
                             "rota_restaurante": rota_restaurante,
@@ -289,18 +290,18 @@ def main():
                     publish_kinesis(KINESIS_ALLOCATION_EVENTS, {
                         "id_pedido": id_pedido,
                         "id_entregador": melhor_entregador,
-                        "tempo_calculo_s": round(elapsed, 4)
+                        "status": "ATIVO", 
+                        "timestamp": timestamp
                     }, partition_key=str(melhor_entregador))
 
                     # 9. PUBLICAR NO KINESIS (dashboard em tempo real)
-                    # ... (publish do ALLOCATION_EVENTS fica igual) ...
 
                     publish_kinesis(KINESIS_ORDER_EVENTS, {
                         "id_pedido": id_pedido,
                         "id_cliente": pedido_dados['id_cliente'],
                         "id_restaurante": pedido_dados['id_restaurante'],
                         "nome_restaurante": pedido_dados.get('nome_restaurante', 'Desconhecido'), # <-- CORREÇÃO AQUI
-                        "status": "ALLOCATED",
+                        "status": None,
                         "id_entregador": melhor_entregador,
                         "timestamp": datetime.utcnow().isoformat(), 
                         "latitude_cliente": float(pedido_dados['latitude_cliente']),
@@ -311,6 +312,7 @@ def main():
 
                 except Exception as e:
                     print(f"[WORKER] Erro gravando nos bancos: {e}")
+                    print(f"[DEBUG] Tipo do TIMESTAMP: {type(timestamp)} - {timestamp}")
                     conn.rollback()
                     # Mensagem não foi deletada — voltará para a fila automaticamente
 

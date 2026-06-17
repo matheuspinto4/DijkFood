@@ -35,6 +35,12 @@ resource "aws_apigatewayv2_route" "throughput" {
   target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
 }
 
+resource "aws_apigatewayv2_route" "restaurantes" {
+  api_id    = aws_apigatewayv2_api.dashboard.id
+  route_key = "GET /metrics/restaurantes"
+  target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
+}
+
 resource "aws_apigatewayv2_stage" "prod" {
   api_id      = aws_apigatewayv2_api.dashboard.id
   name        = "$default"

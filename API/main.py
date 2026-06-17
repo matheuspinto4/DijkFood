@@ -5,7 +5,6 @@ import boto3
 import json
 import concurrent.futures
 
-_async_pool = concurrent.futures.ThreadPoolExecutor(max_workers=20)
 from enum import Enum
 from datetime import datetime, date, time as datetime_time
 from typing import Annotated
@@ -14,7 +13,7 @@ from decimal import Decimal
 from sqlmodel import Field, Session, SQLModel, create_engine, select
 from boto3.dynamodb.conditions import Key
 from pydantic import BaseModel
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, BackgroundTasks
 from botocore.config import Config
 
 # ---------------------------------------------------------------------------
@@ -55,11 +54,13 @@ logger = logging.getLogger(__name__)
 # Kinesis — publicação de eventos para o dashboard em tempo real
 # ---------------------------------------------------------------------------
 KINESIS_REGION            = os.getenv("AWS_REGION_NAME", "us-east-1")
+KINESIS_NEW_ORDER         = os.getenv("KINESIS_NEW_ORDER", "dijkfood-new-order")
 KINESIS_ORDER_EVENTS      = os.getenv("KINESIS_ORDER_EVENTS", "dijkfood-order-events")
+KINESIS_ALLOCATION_EVENTS = os.getenv("KINESIS_ALLOCATION_EVENTS", "dijkfood-allocation-events")
 KINESIS_COURIER_POSITIONS = os.getenv("KINESIS_COURIER_POSITIONS", "dijkfood-courier-positions")
-kinesis = boto3.client("kinesis", region_name=KINESIS_REGION)
+kinesis = boto3.client("kinesis", region_name=KINESIS_REGION, config=boto_config)
 
-def _put_kinesis(stream_name: str, data: dict, partition_key: str):
+def publish_kinesis(stream_name: str, data: dict, partition_key: str):
     try:
         # Adicionamos a quebra de linha (\n) para que o Redshift consiga separar os eventos!
         payload_formatado = json.dumps(data) + "\n"
@@ -72,12 +73,6 @@ def _put_kinesis(stream_name: str, data: dict, partition_key: str):
     except Exception as e:
         logger.error(f"[KINESIS] FALHA -> {stream_name}: {type(e).__name__}: {e}")
 
-def publish_kinesis(stream_name: str, data: dict, partition_key: str):
-    _put_kinesis(stream_name, data, partition_key)
-
-def fire_and_forget(fn, *args, **kwargs):
-    """Executa fn em background sem bloquear a requisição."""
-    _async_pool.submit(fn, *args, **kwargs)
 
 # ---------------------------------------------------------------------------
 # Conexão com Banco de Dados RDS (PostgreSQL)
@@ -258,18 +253,25 @@ def criar_entregador(entregador_in: EntregadorCreate, session: SessionDep):
         raise HTTPException(status_code=500, detail="Erro interno")
 
 @app.post("/entregadores/{id_entregador}/posicao")
-def atualizar_posicao(id_entregador: int, posicao: PosicaoUpdate):
-    fire_and_forget(tabela_telemetria.put_item, Item={
+def atualizar_posicao(id_entregador: int, posicao: PosicaoUpdate, bg_tasks: BackgroundTasks):
+    timestamp = datetime.utcnow().isoformat()
+    bg_tasks.add_task(tabela_telemetria.put_item, Item={
         "id_entregador": str(id_entregador),
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": timestamp,
         "latitude": str(posicao.latitude),
         "longitude": str(posicao.longitude)
     })
-    publish_kinesis(KINESIS_COURIER_POSITIONS, {
-        "id_entregador": id_entregador,
-        "latitude": posicao.latitude,
-        "longitude": posicao.longitude
-    }, partition_key=str(id_entregador))
+    # bg_tasks.add_task(
+    #     publish_kinesis, 
+    #     KINESIS_COURIER_POSITIONS, 
+    #     {
+    #         "id_entregador": id_entregador,
+    #         "timestamp": timestamp,
+    #         "latitude": posicao.latitude,
+    #         "longitude": posicao.longitude
+    #     }, 
+    #     str(id_entregador)
+    # )
     return {"status": "Posição recebida"}
 
 @app.get("/pedidos/", response_model=list[Pedido])
@@ -284,7 +286,7 @@ def consultar_pedido(id_pedido: int, session: SessionDep):
     return pedido
 
 @app.post("/pedidos/", response_model=Pedido)
-def criar_pedido(pedido_in: PedidoCreate, session: SessionDep):
+def criar_pedido(pedido_in: PedidoCreate, session: SessionDep, bg_tasks: BackgroundTasks):
     cliente = session.get(Cliente, pedido_in.id_cliente)
     restaurante = session.get(Restaurante, pedido_in.id_restaurante)
     if not cliente or not restaurante:
@@ -303,13 +305,31 @@ def criar_pedido(pedido_in: PedidoCreate, session: SessionDep):
         session.refresh(novo_pedido)
 
         # DynamoDB e SQS em background — não bloqueiam a resposta ao cliente
+        timestamp = datetime.utcnow().isoformat()
         evento = {
             "id_pedido": str(novo_pedido.id_pedido),
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": timestamp,
             "status": novo_pedido.status,
             "event_id": uuid.uuid4().hex[:8]
         }
-        fire_and_forget(tabela_eventos.put_item, Item=evento)
+        bg_tasks.add_task(tabela_eventos.put_item, Item=evento)
+        bg_tasks.add_task(
+            publish_kinesis,
+            KINESIS_NEW_ORDER, 
+            {
+                "id_pedido": novo_pedido.id_pedido,
+                "id_cliente": novo_pedido.id_cliente,
+                "id_restaurante": novo_pedido.id_restaurante,
+                "lista_itens": pedido_in.lista_itens,
+                "timestamp": timestamp,
+                "latitude_restaurante": restaurante.latitude,
+                "longitude_restaurante": restaurante.longitude,
+                "latitude_cliente": cliente.latitude,
+                "longitude_cliente": cliente.longitude,
+                "status": novo_pedido.status
+            }, 
+            str(novo_pedido.id_restaurante)
+        )
 
         if SQS_QUEUE_URL:
             mensagem_sqs = {
@@ -324,9 +344,11 @@ def criar_pedido(pedido_in: PedidoCreate, session: SessionDep):
                 "longitude_cliente": cliente.longitude,
                 "status": novo_pedido.status
             }
-            fire_and_forget(sqs_client.send_message,
-                            QueueUrl=SQS_QUEUE_URL,
-                            MessageBody=json.dumps(mensagem_sqs))
+            bg_tasks.add_task(
+                sqs_client.send_message,
+                QueueUrl=SQS_QUEUE_URL,
+                MessageBody=json.dumps(mensagem_sqs)
+            )
 
         evento_kinesis = {
             "id_pedido": novo_pedido.id_pedido,
@@ -335,17 +357,18 @@ def criar_pedido(pedido_in: PedidoCreate, session: SessionDep):
             "nome_restaurante": restaurante.nome if restaurante else "Desconhecido",
             "id_entregador": None,
             "lista_itens": pedido_in.lista_itens,
-            "status": novo_pedido.status,
+            "status": None,
             "timestamp": datetime.utcnow().isoformat(), 
             "latitude_cliente": cliente.latitude,        
             "longitude_cliente": cliente.longitude,      
             "latitude_restaurante": restaurante.latitude, 
-            "longitude_restaurante": restaurante.longitude 
+            "longitude_restaurante": restaurante.longitude
         }
-        publish_kinesis(
-            stream_name=KINESIS_ORDER_EVENTS, 
-            data=evento_kinesis, 
-            partition_key=str(novo_pedido.id_pedido)
+        bg_tasks.add_task(
+            publish_kinesis,
+            KINESIS_ORDER_EVENTS, 
+            evento_kinesis, 
+            str(novo_pedido.id_pedido)
         )
 
         return novo_pedido
@@ -398,7 +421,7 @@ def acompanhar_pedido(id_pedido: int):
     }
 
 @app.patch("/pedidos/{id_pedido}/status", response_model=Pedido)
-def atualizar_status_pedido(id_pedido: int, update_data: PedidoStatusUpdate, session: SessionDep):
+def atualizar_status_pedido(id_pedido: int, update_data: PedidoStatusUpdate, session: SessionDep, bg_tasks: BackgroundTasks):
     pedido = session.get(Pedido, id_pedido)
     if not pedido:
         raise HTTPException(status_code=404, detail="Pedido não encontrado")
@@ -422,35 +445,38 @@ def atualizar_status_pedido(id_pedido: int, update_data: PedidoStatusUpdate, ses
         session.commit()
         session.refresh(pedido)
 
+        timestamp = datetime.utcnow().isoformat()
         item_ddb = {
             "id_pedido": str(id_pedido),
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": timestamp,
             "status": novo_status,
             "event_id": uuid.uuid4().hex[:8]
         }
         if pedido.id_entregador:
             item_ddb["id_entregador"] = str(pedido.id_entregador)
 
-        # DynamoDB em background
-        fire_and_forget(tabela_eventos.put_item, Item=item_ddb)
-        
         cliente = session.get(Cliente, pedido.id_cliente)
         restaurante = session.get(Restaurante, pedido.id_restaurante)
-
-        publish_kinesis(KINESIS_ORDER_EVENTS, {
-            "id_pedido": id_pedido,
-            "id_cliente": pedido.id_cliente,
-            "id_restaurante": pedido.id_restaurante,
-            "nome_restaurante": restaurante.nome if restaurante else "Desconhecido",
-            "status": novo_status,
-            "id_entregador": pedido.id_entregador,
-            "timestamp": datetime.utcnow().isoformat(), 
-            "latitude_cliente": cliente.latitude if cliente else None,
-            "longitude_cliente": cliente.longitude if cliente else None,
-            "latitude_restaurante": restaurante.latitude if restaurante else None,
-            "longitude_restaurante": restaurante.longitude if restaurante else None
-        }, partition_key=str(id_pedido))
-        
+        # DynamoDB e Kinesis em background — não bloqueiam a resposta
+        bg_tasks.add_task(tabela_eventos.put_item, Item=item_ddb)
+        bg_tasks.add_task(
+            publish_kinesis, 
+            KINESIS_ORDER_EVENTS, 
+            {
+                "id_pedido": id_pedido,
+                "id_cliente": pedido.id_cliente,
+                "id_restaurante": pedido.id_restaurante,
+                "nome_restaurante": restaurante.nome if restaurante else "Desconhecido",
+                "status": novo_status,
+                "id_entregador": pedido.id_entregador,
+                "timestamp": datetime.utcnow().isoformat(), 
+                "latitude_cliente": cliente.latitude if cliente else None,
+                "longitude_cliente": cliente.longitude if cliente else None,
+                "latitude_restaurante": restaurante.latitude if restaurante else None,
+                "longitude_restaurante": restaurante.longitude if restaurante else None
+            }, 
+            partition_key=str(id_pedido)
+        )
         return pedido
     except Exception as e:
         session.rollback()
@@ -501,16 +527,23 @@ def consultar_alocacao(id_entregador: int):
 @app.post("/alocacoes/{id_entregador}/desativar/{id_pedido}")
 def desativar_alocacao(id_entregador: int, id_pedido: int, session: SessionDep):
     try:
+        timestamp = datetime.utcnow().isoformat()
         tabela_alocacoes.put_item(
             Item={
                 "id_entregador": str(id_entregador),
-                "timestamp": datetime.utcnow().isoformat(),
+                "timestamp": timestamp,
                 "status": "INATIVA",
                 "id_pedido": id_pedido,
                 "rota_restaurante": None,
                 "rota_cliente": None
             }
         )
+        publish_kinesis(KINESIS_ALLOCATION_EVENTS, {
+            "id_pedido": id_pedido,
+            "id_entregador": id_entregador,
+            "status": "INATIVA", 
+            "timestamp": timestamp
+        }, partition_key=str(id_entregador))
 
         entregador = session.get(Entregador, id_entregador)
         pedido = session.get(Pedido, id_pedido)

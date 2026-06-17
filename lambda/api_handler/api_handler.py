@@ -1,6 +1,9 @@
 import json
 import os
 import redis
+from datetime import datetime
+
+STATES = ["CONFIRMED", "PREPARING", "READY_FOR_PICKUP", "PICKED_UP", "IN_TRANSIT", "DELIVERED"]
 
 r = redis.Redis(
     host=os.environ["REDIS_HOST"],
@@ -12,26 +15,80 @@ def handler(event, context):
     path = event.get("rawPath") or event.get("path", "")
 
     if "/metrics/orders" in path:
-        return resp(200, {
-            "total": int(r.get("orders:total") or 0),
-            "por_status": {
-                "CONFIRMED":        int(r.get("orders:status:CONFIRMED") or 0),
-                "PREPARING":        int(r.get("orders:status:PREPARING") or 0),
-                "READY_FOR_PICKUP": int(r.get("orders:status:READY_FOR_PICKUP") or 0),
-                "IN_TRANSIT":       int(r.get("orders:status:IN_TRANSIT") or 0),
-                "DELIVERED":        int(r.get("orders:status:DELIVERED") or 0),
+        orders_status = r.hgetall("orders:status")
+        orders_status = {
+            status: int(orders_status.get(status) or 0)
+            for status in STATES
+        }
+        orders_regioes = {
+            regiao: int(quantity)
+            for regiao, quantity in r.hgetall("orders:regiao").items()
+        }
+        orders_weekdayhour = {
+            weekdayhour: int(quantity)
+            for weekdayhour, quantity in r.hgetall("orders:week_demand").items()
+        }
+        orders_status_qtt = r.hgetall("orders:status_hist_quantity")
+        orders_status_dur = r.hgetall("orders:status_hist_durations")
+        orders_status_duration = {
+            status: float(orders_status_dur.get(status) or 0) / max(int(orders_status_qtt.get(status) or 0), 1)
+            for status in STATES
+        }
+        top_restaurants = [
+            {
+                "id": rid,
+                "pedidos": int(volume)
             }
+            for rid, volume in r.zrevrange(
+                "restaurants:volume",
+                0,
+                9,
+                withscores=True
+            )
+        ]
+        return resp(200, {
+            "por_status": orders_status,
+            "por_regiao": orders_regioes, 
+            "por_dia_semana": orders_weekdayhour, 
+            "top_10_restaurants": top_restaurants, 
+            "duracao_media_por_status": orders_status_duration,
+            "histograma_duracao": {
+                int(k): int(v)
+                for k, v in r.hgetall("orders:duration_dist").items()
+            },
+            "itens": {
+                k: int(v)
+                for k, v in r.hgetall("itens:quantity").items()
+            },
+            "quantidade": r.scard("orders:active"),
+            "total": r.get("throughput:orders"),
         })
 
     elif "/metrics/entregadores" in path:
         return resp(200, {
-            "ativos": r.scard("couriers:active")
+            "ativos": r.scard("couriers:active"),
+            "busy_time": float(r.get("couriers:busy_time") or 0), 
+            "idle_time": float(r.get("couriers:idle_time") or 0)
         })
 
     elif "/metrics/throughput" in path:
         return resp(200, {
             "pedidos_ultimo_minuto": int(r.get("throughput:orders") or 0),
             "alocacoes_total":       int(r.get("allocations:total") or 0),
+        })
+        
+    elif "/metrics/restaurantes" in path:
+        now = datetime.utcnow()
+        slot = f"{now.isoweekday()}-{now.strftime('%H')}"
+
+        ativos = int(r.get("metrics:restaurantes:ativos") or 0)
+        ativos_max = int(r.get("metrics:restaurantes:ativos_max") or 1)
+        atual_hora = int(r.get(f"metrics:restaurantes:slot:{slot}") or 0)
+        max_hora = int(r.get(f"metrics:restaurantes:slot_max:{slot}") or 1)
+
+        return resp(200, {
+            "utilizacao_capacidade": round(100 * ativos / max(ativos_max, 1), 2),
+            "aderencia_horaria": round(100 * atual_hora / max(max_hora, 1), 2),
         })
 
     return resp(404, {"erro": "rota não encontrada"})
